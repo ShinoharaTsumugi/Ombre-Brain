@@ -469,6 +469,57 @@ async def dream_hook(request):
 
 
 # =============================================================
+# grow input dedup: identical content within 24h is skipped
+# grow 入口去重：24小时内收到完全相同的内容直接跳过
+#
+# ka2 keepalive 的 auto-grow 在 grow 超时/报错时不推进水位线，
+# 每隔约30分钟把同一段聊天记录原样重发；服务端往往已经建好桶，
+# 于是同一事件被存 30~60 份。这里按内容哈希去重：
+# 检查在入口，登记在处理成功之后（中途失败仍可重试）。
+# 哈希文件存 buckets_dir（持久卷），redeploy 不丢。
+# =============================================================
+_GROW_SEEN_PATH = os.path.join(config["buckets_dir"], ".grow_seen.json")
+_GROW_SEEN_WINDOW_HOURS = 24
+
+
+def _grow_content_hash(content: str) -> str:
+    return hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
+
+
+def _grow_seen_load() -> dict:
+    try:
+        with open(_GROW_SEEN_PATH, "r", encoding="utf-8") as f:
+            data = _json_lib.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _grow_seen_check(content: str) -> bool:
+    """True if identical content was already grown successfully within the window."""
+    ts = _grow_seen_load().get(_grow_content_hash(content))
+    try:
+        return bool(ts) and (time.time() - float(ts)) < _GROW_SEEN_WINDOW_HOURS * 3600
+    except (TypeError, ValueError):
+        return False
+
+
+def _grow_seen_record(content: str) -> None:
+    """Record content hash after buckets were actually written (prunes expired entries)."""
+    now = time.time()
+    seen = {
+        k: v for k, v in _grow_seen_load().items()
+        if isinstance(v, (int, float)) and now - v < _GROW_SEEN_WINDOW_HOURS * 3600
+    }
+    seen[_grow_content_hash(content)] = now
+    try:
+        with open(_GROW_SEEN_PATH, "w", encoding="utf-8") as f:
+            _json_lib.dump(seen, f)
+    except Exception as e:
+        logger.warning(f"grow dedup: failed to persist seen hashes / 去重记录写入失败: {e}")
+
+
+# =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
 # Shared by hold and grow to avoid duplicate logic
@@ -489,6 +540,18 @@ async def _merge_or_create(
     检查是否有相似桶可合并，有则合并，无则新建。
     返回 (桶ID或名称, 是否合并)。
     """
+    # --- Exact-content guard: a byte-identical bucket already exists → reuse it ---
+    # --- 完全相同内容兜底：已有一字不差的桶就直接复用，不再合并/新建 ---
+    # 相似度合并只查 top-1 且受阈值影响，措辞漂移时拦不住重复；
+    # 这里兜住最恶性的情况（钉选桶跳过合并也会被这里拦下）。
+    try:
+        norm = content.strip()
+        for b in await bucket_mgr.list_all():
+            if b.get("content", "").strip() == norm:
+                return b["metadata"].get("name", b["id"]), True
+    except Exception as e:
+        logger.warning(f"Exact-dup guard failed / 完全重复检查失败: {e}")
+
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
     except Exception as e:
@@ -962,6 +1025,12 @@ async def grow(content: str) -> str:
     if not content or not content.strip():
         return "内容为空，无法整理。"
 
+    # --- Dedup: identical content re-sent within 24h (ka2 retry loop) ---
+    # --- 去重：24小时内重复收到同样的内容（ka2 重试循环）直接跳过 ---
+    if _grow_seen_check(content):
+        logger.info("grow dedup: identical content within 24h, skipped / 24小时内重复内容，已跳过")
+        return "重复内容（24小时内已归档过同样的内容），已跳过。"
+
     # --- Short content fast path: skip digest, use hold logic directly ---
     # --- 短内容快速路径：跳过 digest 拆分，直接走 hold 逻辑省一次 API ---
     # For very short inputs (like "1"), calling digest is wasteful:
@@ -987,6 +1056,7 @@ async def grow(content: str) -> str:
             name=analysis.get("suggested_name", ""),
         )
         action = "合并" if is_merged else "新建"
+        _grow_seen_record(content)
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
@@ -1029,6 +1099,12 @@ async def grow(content: str) -> str:
                 f"{item.get('name', '?')}: {e}"
             )
             results.append(f"⚠️{item.get('name', '?')}")
+
+    # Only mark as seen when something was actually written,
+    # so a fully-failed run can still be retried by the caller.
+    # 只有真的写入了桶才登记去重哈希，全部失败时调用方还能重试。
+    if created + merged > 0:
+        _grow_seen_record(content)
 
     return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
 

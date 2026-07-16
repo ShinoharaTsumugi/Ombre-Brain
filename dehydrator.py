@@ -351,6 +351,45 @@ class Dehydrator:
 
 
     # ---------------------------------------------------------
+    # Render dehydration JSON into prose
+    # 把脱水 JSON 渲染成散文
+    # DEHYDRATE_PROMPT 要求模型输出 {core_facts, emotion_state, todos,
+    # keywords, summary} 的 JSON，但这份 JSON 不能原样外流：它会被注入
+    # 聊天上下文，再被模型引用着 hold/grow 回记忆库，变成 JSON 正文的桶。
+    # 这里统一转成可读文本；非 JSON 输入原样返回（含旧缓存里的散文）。
+    # ---------------------------------------------------------
+    @staticmethod
+    def _render_summary_json(raw: str) -> str:
+        text = (raw or "").strip()
+        # strip markdown code fence / 去掉 markdown 代码围栏
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            return raw
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+        if not isinstance(data, dict):
+            return raw
+
+        parts = []
+        summary = str(data.get("summary") or "").strip()
+        if summary:
+            parts.append(summary)
+        facts = [str(f).strip() for f in (data.get("core_facts") or []) if str(f).strip()]
+        if facts:
+            parts.append("；".join(facts))
+        emotion = str(data.get("emotion_state") or "").strip()
+        if emotion:
+            parts.append(f"情绪：{emotion}")
+        todos = [str(t).strip() for t in (data.get("todos") or []) if str(t).strip()]
+        if todos:
+            parts.append("待办：" + "；".join(todos))
+        # 不是脱水摘要结构的 JSON（或全空）就原样返回
+        return "\n".join(parts) if parts else raw
+
+    # ---------------------------------------------------------
     # Output formatting
     # 输出格式化
     # Wraps dehydrated result with bucket name, tags, emotion coords
@@ -385,6 +424,7 @@ class Dehydrator:
                 header += " [已消化]"
             header += "\n"
         
+        content = self._render_summary_json(content)
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
         return f"{header}{content}"
 
