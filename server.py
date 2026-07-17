@@ -1693,6 +1693,11 @@ async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
+    if err:
+        # Bearer token fallback (read-only): the API token already grants
+        # trace/breath, so listing is no privilege escalation.
+        # Bearer 令牌兜底（只读）：token 本就有 trace/breath 权限，列表不算提权。
+        err = _check_api_auth(request)
     if err: return err
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=True)
@@ -1729,6 +1734,10 @@ async def api_bucket_detail(request):
     """Get full bucket content by ID."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
+    if err:
+        # Bearer token fallback (read-only), same rationale as /api/buckets
+        # Bearer 令牌兜底（只读），理由同 /api/buckets
+        err = _check_api_auth(request)
     if err: return err
     bucket_id = request.path_params["bucket_id"]
     bucket = await bucket_mgr.get(bucket_id)
