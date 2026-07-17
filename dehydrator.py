@@ -175,7 +175,7 @@ class Dehydrator:
         self.api_key = dehy_cfg.get("api_key", "")
         self.model = dehy_cfg.get("model", "deepseek-chat")
         self.base_url = dehy_cfg.get("base_url", "https://api.deepseek.com/v1")
-        self.max_tokens = dehy_cfg.get("max_tokens", 1024)
+        self.max_tokens = dehy_cfg.get("max_tokens", 2048)
         self.temperature = dehy_cfg.get("temperature", 0.1)
 
         # --- API availability / 是否有可用的 API ---
@@ -367,19 +367,65 @@ class Dehydrator:
     # 这里统一转成可读文本；非 JSON 输入原样返回（含旧缓存里的散文）。
     # ---------------------------------------------------------
     @staticmethod
+    def _salvage_summary_fields(text: str) -> dict | None:
+        """
+        Salvage fields from a broken summary JSON.
+        从损坏的摘要 JSON 里抢救字段。
+        超大桶的脱水输出会在 max_tokens 处被截断（JSON 没闭合），偶尔还混入
+        乱码字符，json.loads 必然失败。这里用正则把仍然完整的字段捞出来，
+        宁可少一条事实，也不把整块烂 JSON 原样外流。
+        """
+        def _unescape(s: str) -> str:
+            try:
+                return json.loads(f'"{s}"')
+            except Exception:
+                return s
+
+        def _string_field(key: str) -> str:
+            m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)' % key, text)
+            return _unescape(m.group(1)) if m else ""
+
+        def _array_field(key: str) -> list:
+            m = re.search(r'"%s"\s*:\s*\[' % key, text)
+            if not m:
+                return []
+            seg = text[m.end():]
+            end = seg.find("]")
+            if end != -1:
+                seg = seg[:end]
+            return [_unescape(s) for s in re.findall(r'"((?:[^"\\]|\\.)*)"', seg)]
+
+        data = {
+            "summary": _string_field("summary"),
+            "emotion_state": _string_field("emotion_state"),
+            "core_facts": _array_field("core_facts"),
+            "todos": _array_field("todos"),
+        }
+        if not (data["summary"] or data["core_facts"]):
+            return None
+        return data
+
+    @staticmethod
     def _render_summary_json(raw: str) -> str:
         text = (raw or "").strip()
         # strip markdown code fence / 去掉 markdown 代码围栏
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        if not (text.startswith("{") and text.endswith("}")):
+        if not text.startswith("{"):
             return raw
-        try:
-            data = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            return raw
-        if not isinstance(data, dict):
-            return raw
+        data = None
+        if text.endswith("}"):
+            try:
+                loaded = json.loads(text)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if data is None:
+            # truncated or corrupted → salvage / 截断或损坏 → 抢救字段
+            data = Dehydrator._salvage_summary_fields(text)
+            if data is None:
+                return raw
 
         parts = []
         summary = str(data.get("summary") or "").strip()

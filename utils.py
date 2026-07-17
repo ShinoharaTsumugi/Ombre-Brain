@@ -38,7 +38,8 @@ def load_config(config_path: str = None) -> dict:
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",
             "api_key": "",
-            "max_tokens": 1024,
+            # 1024 会把超大桶的摘要 JSON 截断在半截字符串上，导致无法解析
+            "max_tokens": 2048,
             "temperature": 0.1,
         },
         "decay": {
