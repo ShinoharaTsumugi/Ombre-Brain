@@ -312,6 +312,23 @@ class Dehydrator:
             raise RuntimeError(f"API 合并失败，请检查 API 连接: {e}") from e
 
     # ---------------------------------------------------------
+    # Gemini: disable thinking for utility calls
+    # Gemini：工具型调用关闭思考
+    # gemini-2.5 系列是思考模型，思考 token 计入 max_tokens——思考一长，
+    # 正文就被挤成 ~100 字符的半截 JSON（脱水摘要碎片、analyze 解析失败
+    # 落默认值导致大量"未分类/无名"桶，均源于此）。
+    # 仅对 gemini 非 pro 型号加该参数（pro 不允许 thinking_budget=0；
+    # 其他后端不加，避免未知字段被拒）。
+    # ---------------------------------------------------------
+    def _no_thinking_kwargs(self) -> dict:
+        model = (self.model or "").lower()
+        if "gemini" in model and "pro" not in model:
+            return {"extra_body": {"extra_body": {"google": {
+                "thinking_config": {"thinking_budget": 0, "include_thoughts": False}
+            }}}}
+        return {}
+
+    # ---------------------------------------------------------
     # API call: dehydration
     # API 调用：脱水压缩
     # ---------------------------------------------------------
@@ -328,6 +345,7 @@ class Dehydrator:
             ],
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            **self._no_thinking_kwargs(),
         )
         if not response.choices:
             return ""
@@ -351,6 +369,7 @@ class Dehydrator:
             ],
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            **self._no_thinking_kwargs(),
         )
         if not response.choices:
             return ""
@@ -526,8 +545,9 @@ class Dehydrator:
                 {"role": "system", "content": ANALYZE_PROMPT},
                 {"role": "user", "content": content[:2000]},
             ],
-            max_tokens=256,
+            max_tokens=512,
             temperature=0.1,
+            **self._no_thinking_kwargs(),
         )
         if not response.choices:
             return self._default_analysis()
@@ -638,6 +658,7 @@ class Dehydrator:
             ],
             max_tokens=2048,
             temperature=0.0,
+            **self._no_thinking_kwargs(),
         )
         if not response.choices:
             return []
