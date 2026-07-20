@@ -46,10 +46,9 @@ import sqlite3
 import httpx
 from datetime import datetime, timezone, timedelta
 
-AEST = timezone(timedelta(hours=10))
-
-def _now_aest() -> str:
-    return datetime.now(AEST).strftime("%Y-%m-%d %H:%M:%S")
+def _now_local() -> str:
+    """events 表用的朴素本地时间串（与 SQL 里的字符串比较保持同一时区）。"""
+    return now_local_str()
 
 # --- Ensure same-directory modules can be imported ---
 # --- 确保同目录下的模块能被正确导入 ---
@@ -62,7 +61,8 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import (load_config, setup_logging, strip_wikilinks, count_tokens_approx,
+                   LOCAL_TZ, LOCAL_TZ_NAME, now_local_str, fmt_local, ts_sort_key)
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -116,7 +116,7 @@ OMBRE_EVENTS_TOKEN = os.environ.get("OMBRE_EVENTS_TOKEN", "")
 _events_db_path = os.path.join(config["buckets_dir"], "events.db")
 
 def _init_events_db():
-    """Create events table if not exists."""
+    """Create events table if not exists (+ one-off timezone migration)."""
     conn = sqlite3.connect(_events_db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
@@ -127,6 +127,24 @@ def _init_events_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)")
+    # --- 一次性迁移：旧行是写死 AEST(UTC+10) 的朴素时间串，新行改用本地时区 ---
+    # 这张表的时间戳不带偏移，SQL 里是裸字符串比较，新旧混在一起会出两种错：
+    # 去重窗口从 5 分钟被撑成 2 小时（新事件被静默丢弃）、sense 把旧事件显示成未来时间。
+    # 用 PRAGMA user_version 作标记，保证只迁移一次。
+    try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            off_hours = (datetime.now(LOCAL_TZ).utcoffset().total_seconds() / 3600.0) - 10.0
+            if abs(off_hours) > 0.01:
+                n = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                if n:
+                    conn.execute(
+                        "UPDATE events SET created_at = datetime(created_at, ?)",
+                        (f"{off_hours:+g} hours",),
+                    )
+                    logger.info(f"events 表时区迁移：{n} 行由 AEST 平移 {off_hours:+g} 小时至 {LOCAL_TZ_NAME}")
+            conn.execute("PRAGMA user_version = 1")
+    except Exception as e:
+        logger.warning(f"events 表时区迁移失败（不影响启动）: {e}")
     conn.commit()
     conn.close()
 
@@ -136,12 +154,12 @@ def _record_event(event_type: str, value: str) -> bool:
     # Dedup: skip if same type within 5 minutes
     row = conn.execute(
     "SELECT id FROM events WHERE type = ? AND created_at > datetime(?, '-5 minutes') LIMIT 1",
-    (event_type, _now_aest())
+    (event_type, _now_local())
 ).fetchone()
     if row:
         conn.close()
         return False
-    conn.execute("INSERT INTO events (type, value, created_at) VALUES (?, ?, ?)", (event_type, value, _now_aest()))
+    conn.execute("INSERT INTO events (type, value, created_at) VALUES (?, ?, ?)", (event_type, value, _now_local()))
     conn.commit()
     conn.close()
     return True
@@ -151,7 +169,7 @@ def _get_recent_events(hours: int = 6, limit: int = 50) -> list[dict]:
     conn = sqlite3.connect(_events_db_path)
     rows = conn.execute(
     "SELECT type, value, created_at FROM events WHERE created_at > datetime(?, ? || ' hours') ORDER BY created_at DESC LIMIT ?",
-    (_now_aest(), f"-{hours}", limit)
+    (_now_local(), f"-{hours}", limit)
 ).fetchall()
     conn.close()
     return [{"type": r[0], "value": r[1], "time": r[2]} for r in rows]
@@ -444,7 +462,7 @@ async def dream_hook(request):
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
         ]
-        candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        candidates.sort(key=lambda b: ts_sort_key(b["metadata"].get("created", "")), reverse=True)
         recent = candidates[:10]
 
         if not recent:
@@ -787,12 +805,12 @@ async def breath(
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
             feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
-            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            feels.sort(key=lambda b: ts_sort_key(b["metadata"].get("created", "")), reverse=True)
             if not feels:
                 return "没有留下过 feel。"
             results = []
             for f in feels:
-                created = f["metadata"].get("created", "")
+                created = fmt_local(f["metadata"].get("created", ""))
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
@@ -1298,7 +1316,7 @@ async def dream() -> str:
     ]
 
     # --- Sort by creation time desc, take top 10 ---
-    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+    candidates.sort(key=lambda b: ts_sort_key(b["metadata"].get("created", "")), reverse=True)
     recent = candidates[:10]
 
     if not recent:
@@ -1311,7 +1329,7 @@ async def dream() -> str:
         domains = ",".join(meta.get("domain", []))
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
-        created = meta.get("created", "")
+        created = fmt_local(meta.get("created", ""))
         parts.append(
             f"[{meta.get('name', b['id'])}]{resolved_tag} "
             f"主题:{domains} V{val:.1f}/A{aro:.1f} "
@@ -1401,10 +1419,10 @@ async def dream() -> str:
 # =============================================================
 @mcp.tool()
 async def now() -> str:
-    """now - 返回当前AEST时间。"""
-    from datetime import datetime, timezone, timedelta
-    aest = timezone(timedelta(hours=10))
-    return datetime.now(aest).strftime("%Y-%m-%d %H:%M:%S AEST (%A)")
+    """now - 返回当前时间（本地时区，由 OMBRE_TZ 决定，默认上海）。"""
+    n = datetime.now(LOCAL_TZ)
+    weekday = "一二三四五六日"[n.weekday()]
+    return n.strftime("%Y-%m-%d %H:%M:%S") + f" 星期{weekday}（时区：{LOCAL_TZ_NAME}）"
 
 
 @mcp.tool()
@@ -1415,9 +1433,9 @@ async def sense(hours: int = 3) -> str:
     events = _get_recent_events(hours=hours)
     if not events:
         return f"最近 {hours} 小时无活动记录。"
-    lines = [f"最近 {hours} 小时的活动（{len(events)} 条）："]
+    lines = [f"最近 {hours} 小时的活动（{len(events)} 条，时间为{LOCAL_TZ_NAME}）："]
     for e in events:
-        lines.append(f"  - {e['time']}  {e['type']}: {e['value']}")
+        lines.append(f"  - {fmt_local(e['time'], '%m-%d %H:%M')}  {e['type']}: {e['value']}")
     return "\n".join(lines)
 
 # =============================================================
@@ -1475,20 +1493,19 @@ def _check_api_auth(request):
 # --- GET /api/now ---
 @mcp.custom_route("/api/now", methods=["GET"])
 async def api_now(request):
-    """返回当前 AEST 时间"""
+    """返回当前本地时间（时区由 OMBRE_TZ 决定）"""
     from starlette.responses import JSONResponse
-    from datetime import datetime, timezone, timedelta
-    
+
     err = _check_api_auth(request)
     if err:
         return err
     
-    aest = timezone(timedelta(hours=10))
-    now_aest = datetime.now(aest)
+    n = datetime.now(LOCAL_TZ)
     return JSONResponse({
-        "time": now_aest.strftime("%Y-%m-%d %H:%M:%S AEST"),
-        "weekday": now_aest.strftime("%A"),
-        "iso": now_aest.isoformat(),
+        "time": n.strftime("%Y-%m-%d %H:%M:%S") + f" ({LOCAL_TZ_NAME})",
+        "weekday": n.strftime("%A"),
+        "timezone": LOCAL_TZ_NAME,
+        "iso": n.isoformat(),
     })
 
 
@@ -2252,7 +2269,7 @@ async def api_import_results(request):
         limit = int(request.query_params.get("limit", "50"))
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # Sort by created time, newest first
-        all_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        all_buckets.sort(key=lambda b: ts_sort_key(b["metadata"].get("created", "")), reverse=True)
         results = []
         for b in all_buckets[:limit]:
             results.append({

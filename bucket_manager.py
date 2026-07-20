@@ -36,7 +36,7 @@ from typing import Optional
 import frontmatter
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, parse_ts, now_diff_days
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -368,8 +368,9 @@ class BucketManager:
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
-            await self._time_ripple(bucket_id, current_time)
+            current_time = parse_ts(post.get("created", post.get("last_active", "")))
+            if current_time is not None:
+                await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
 
@@ -396,12 +397,11 @@ class BucketManager:
             if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
                 continue
 
-            created_str = meta.get("created", meta.get("last_active", ""))
-            try:
-                created = datetime.fromisoformat(str(created_str))
-                delta_hours = abs((reference_time - created).total_seconds()) / 3600
-            except (ValueError, TypeError):
+            # parse_ts 会把朴素值补成本地时区，避免新旧混排时 aware/naive 相减抛错
+            created = parse_ts(meta.get("created", meta.get("last_active", "")))
+            if created is None:
                 continue
+            delta_hours = abs((reference_time - created).total_seconds()) / 3600
 
             if delta_hours <= hours:
                 # Boost activation_count by 0.3 (fractional), don't change last_active
@@ -608,13 +608,15 @@ class BucketManager:
         Calculate time proximity score (0~1, more recent = higher).
         计算时间亲近度。
         """
-        last_active_str = meta.get("last_active", meta.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days = 30
-        return math.exp(-0.02 * days)
+        # 带偏移的时间戳要用 aware 的当前时间去减（旧写法 datetime.now() 是朴素的，
+        # 相减抛 TypeError 被吞 → days 恒为 30，这个子分一直是常数 e^(-0.6)=0.5488）
+        days = now_diff_days(meta.get("last_active", meta.get("created", "")))
+        days = 30 if days is None else max(0.0, days)
+        # 地板值 = 修复前那个常数。时间分占搜索总分约 17.6/100，而 fuzzy_threshold(50)
+        # 是硬门槛——低于它的桶直接不进结果，不是排后面。若放任衰减到 0，几个月前的
+        # 旧记忆会从「排得靠后」变成「搜不到」，等于悄悄失忆。加地板后每个桶的得分
+        # 都 ≥ 修复前，可达性只增不减，同时新鲜度仍在地板之上参与排序。
+        return max(0.5488, math.exp(-0.02 * days))
 
     # ---------------------------------------------------------
     # List all buckets

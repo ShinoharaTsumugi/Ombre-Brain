@@ -16,7 +16,46 @@ import yaml
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-AEST = timezone(timedelta(hours=10))
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
+# ── 本地时区：记忆库所有时间戳的生成与展示都走这里 ──────────────────
+# 默认 Asia/Shanghai（紬 2026-06-23 回国后常驻）；换地方只需设环境变量
+# OMBRE_TZ 为 IANA 名（如 Australia/Sydney），无需改代码。
+#
+# 历史：2026-07 之前这里写死 AEST(UTC+10)，导致她读记忆时间戳会比北京时间
+# 快 2 小时，而聊天应用注入的【当前时间】是正确的本地时间——两个时钟打架。
+# 旧桶的 created/last_active 是带 +10:00 偏移的完整 ISO，绝对时刻正确，
+# 读取时转成本地时区即可，不需要回填。
+# 注意 .strip() 必须在 or 之前：否则 OMBRE_TZ=" "（面板里清空变量常留下的空白）
+# 是真值，绕过默认值又被 strip 成空串 → 回退 UTC，整库时间戳偏 8 小时。
+_TZ_NAME = os.environ.get("OMBRE_TZ", "").strip() or "Asia/Shanghai"
+# 容器里没装 tzdata 时 ZoneInfo 会抛错；这几个区全年固定偏移（中国 1991 年后无夏令时），
+# 用静态偏移兜底完全等价，不至于整个服务退回 UTC。
+_FIXED_FALLBACK = {
+    "Asia/Shanghai": 8, "Asia/Hong_Kong": 8, "Asia/Taipei": 8, "Asia/Macau": 8,
+    "Asia/Singapore": 8, "PRC": 8, "Asia/Tokyo": 9, "Asia/Seoul": 9,
+}
+
+
+def _load_tz(name):
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name), name
+        except Exception:
+            pass
+    if name in _FIXED_FALLBACK:
+        off = _FIXED_FALLBACK[name]
+        logging.warning(f"zoneinfo 不可用，{name} 回退为固定 UTC+{off}（该区无夏令时，等价）")
+        return timezone(timedelta(hours=off)), name
+    logging.warning(f"时区 {name} 不可用且无固定回退，退回 UTC")
+    return timezone.utc, "UTC"
+
+
+LOCAL_TZ, LOCAL_TZ_NAME = _load_tz(_TZ_NAME)
 
 
 def load_config(config_path: str = None) -> dict:
@@ -228,7 +267,77 @@ def count_tokens_approx(text: str) -> int:
 
 def now_iso() -> str:
     """
-    Return current time as ISO format string.
-    返回当前时间的 ISO 格式字符串。
+    Return current local time as ISO string (with offset, so the instant is unambiguous).
+    返回当前本地时间的 ISO 字符串（带时区偏移，绝对时刻无歧义）。
     """
-    return datetime.now(AEST).isoformat(timespec="seconds")
+    return datetime.now(LOCAL_TZ).isoformat(timespec="seconds")
+
+
+def now_local_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """
+    Current local time as a naive string (for stores that compare timestamps as text).
+    当前本地时间的朴素字符串（用于 events 这类按字符串大小比较的表）。
+    """
+    return datetime.now(LOCAL_TZ).strftime(fmt)
+
+
+def parse_ts(value):
+    """
+    Parse any stored timestamp into an aware datetime; None if unparseable.
+    把存储的时间戳解析成带时区的 datetime，失败返回 None。
+    兼容三种历史格式：带偏移 ISO（+10:00 旧桶 / +08:00 新桶）、朴素 ISO、
+    朴素 "YYYY-MM-DD HH:MM:SS"。朴素值按本地时区解释。
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        dt = None
+        for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, f)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=LOCAL_TZ)
+
+
+def fmt_local(value, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """
+    Render a stored timestamp in local time for the model to read.
+    把存储的时间戳转成本地时区的可读字符串（解析失败则原样返回）。
+    给模型看的时间一律走这里——绝不能再吐带 +10:00 的裸 ISO，
+    否则它会把外地时区的钟点当成此刻的本地时间。
+    """
+    dt = parse_ts(value)
+    if dt is None:
+        return str(value or "")
+    return dt.astimezone(LOCAL_TZ).strftime(fmt)
+
+
+def ts_sort_key(value):
+    """
+    Sort key for timestamps. 排序键：跨时区混排时字典序会算错先后，必须比较绝对时刻。
+    （旧桶 +10:00 与新桶 +08:00 并存时，"03:57+10:00" 字典序大于 "02:00+08:00"，
+    但后者其实更晚——直接 sort 字符串会把新旧顺序排反。）
+    """
+    dt = parse_ts(value)
+    return dt if dt is not None else datetime.min.replace(tzinfo=timezone.utc)
+
+
+def now_diff_days(value) -> float:
+    """
+    Days elapsed since a stored timestamp (0 if unparseable-safe caller wants that).
+    距某个存储时间戳过去了多少天；无法解析返回 None，由调用方决定兜底值。
+    注意：必须用 datetime.now(LOCAL_TZ)（aware）去减 aware 时间戳——
+    历史上这里用了朴素的 datetime.now()，与带偏移的时间戳相减必抛 TypeError，
+    被 except 吞掉后衰减时间维度形同虚设。
+    """
+    dt = parse_ts(value)
+    if dt is None:
+        return None
+    return (datetime.now(LOCAL_TZ) - dt).total_seconds() / 86400.0

@@ -19,12 +19,27 @@
 # 被谁依赖：server.py
 # ============================================================
 
+import os
 import math
 import asyncio
 import logging
 from datetime import datetime
 
+from utils import now_diff_days
+
 logger = logging.getLogger("ombre_brain.decay")
+
+# ── 归档安全阀 ────────────────────────────────────────────────────────
+# 2026-07 之前 days_since 因 naive/aware 相减异常恒为 30，未解决的桶分数恒在 1.3 上下，
+# 永远跌不破阈值——「按时间遗忘」这条路径其实从未真正生效过（只有已解决的桶会被归档）。
+# 现在时间维度修好了，若直接放开，积累两个月的旧桶会在一轮里被成批归档
+# （λ=0.05、阈值 0.3 时，重要度5的桶约 59 天、重要度10的约 73 天就跌破）。
+# 那是不可替代的个人记忆，不能因为一个 bug 修复被悄悄吞掉。
+# 因此默认维持修复前的实际行为：只归档「已解决」的桶。
+# 想启用完整的时间遗忘，设 OMBRE_DECAY_ARCHIVE_UNRESOLVED=true。
+ARCHIVE_UNRESOLVED = os.environ.get(
+    "OMBRE_DECAY_ARCHIVE_UNRESOLVED", ""
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 class DecayEngine:
@@ -116,12 +131,12 @@ class DecayEngine:
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
         # --- Days since last activation ---
-        last_active_str = metadata.get("last_active", metadata.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days_since = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
+        # 时间戳带时区偏移，必须用 aware 的当前时间去减（历史上这里用朴素 datetime.now()，
+        # 相减必抛 TypeError 被吞掉 → days_since 恒为 30，衰减的时间维度形同虚设）
+        days_since = now_diff_days(metadata.get("last_active", metadata.get("created", "")))
+        if days_since is None:
             days_since = 30
+        days_since = max(0.0, days_since)
 
         # --- Emotion weight ---
         try:
@@ -195,6 +210,7 @@ class DecayEngine:
         checked = 0
         archived = 0
         auto_resolved = 0
+        skipped_unresolved = 0   # 低于阈值但因安全阀保住的未解决桶
         lowest_score = float("inf")
 
         for bucket in buckets:
@@ -211,11 +227,10 @@ class DecayEngine:
             # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
             if not meta.get("resolved", False):
                 imp = int(meta.get("importance", 5))
-                last_active_str = meta.get("last_active", meta.get("created", ""))
-                try:
-                    last_active = datetime.fromisoformat(str(last_active_str))
-                    days_since = (datetime.now() - last_active).total_seconds() / 86400
-                except (ValueError, TypeError):
+                # 同上：解析失败才当作很久以前；不能让 aware/naive 相减异常把
+                # 所有 imp≤4 的新桶都判成「超过30天」直接沉底
+                days_since = now_diff_days(meta.get("last_active", meta.get("created", "")))
+                if days_since is None:
                     days_since = 999
                 if imp <= 4 and days_since > 30:
                     try:
@@ -244,6 +259,10 @@ class DecayEngine:
             # --- Below threshold → archive (simulate forgetting) ---
             # --- 低于阈值 → 归档（模拟遗忘）---
             if score < self.threshold:
+                # 安全阀：未解决的桶默认不因时间衰减被归档（见文件头说明）
+                if not (meta.get("resolved", False) or ARCHIVE_UNRESOLVED):
+                    skipped_unresolved += 1
+                    continue
                 try:
                     success = await self.bucket_mgr.archive(bucket["id"])
                     if success:
@@ -263,9 +282,15 @@ class DecayEngine:
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
+            "protected_unresolved": skipped_unresolved,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
+        if skipped_unresolved:
+            logger.info(
+                f"{skipped_unresolved} 个未解决桶已跌破阈值但被安全阀保留"
+                f"（要启用按时间遗忘：OMBRE_DECAY_ARCHIVE_UNRESOLVED=true）"
+            )
         return result
 
     # ---------------------------------------------------------
