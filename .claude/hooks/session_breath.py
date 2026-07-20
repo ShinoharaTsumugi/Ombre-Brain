@@ -13,6 +13,8 @@
 # Config:
 #   OMBRE_HOOK_URL  — override the server URL (default: http://localhost:8000)
 #   OMBRE_HOOK_SKIP — set to "1" to disable the hook temporarily
+#   OMBRE_API_TOKEN — auth token; required since the hook endpoints are gated
+#                     鉴权令牌：hook 端点已加鉴权，远程调用必须提供
 # ============================================================
 
 import os
@@ -35,9 +37,16 @@ def main():
 
 
 def _call_endpoint(base_url, path):
+    headers = {"Accept": "text/plain"}
+    # The hook endpoints return memory content and are authenticated.
+    # Sent as a header, never a query param (query strings land in access logs).
+    # hook 端点返回记忆正文、已加鉴权。令牌走请求头，不走 query（query 会进访问日志）。
+    token = os.environ.get("OMBRE_API_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         f"{base_url}{path}",
-        headers={"Accept": "text/plain"},
+        headers=headers,
         method="GET",
     )
     try:

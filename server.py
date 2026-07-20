@@ -397,6 +397,11 @@ async def health_check(request):
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
+    # This endpoint returns memory content in plaintext — it must be authenticated.
+    # 本端点直接返回记忆正文，必须鉴权。
+    err = _check_api_auth(request)
+    if err:
+        return err
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # pinned
@@ -454,6 +459,11 @@ async def breath_hook(request):
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
+    # This endpoint returns raw bucket content — it must be authenticated.
+    # 本端点直接返回记忆桶原文，必须鉴权。
+    err = _check_api_auth(request)
+    if err:
+        return err
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
