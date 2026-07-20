@@ -1157,22 +1157,53 @@ async def trace(
     digested: int = -1,
     content: str = "",
     delete: bool = False,
+    restore: bool = False,
 ) -> str:
-    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True遗忘(可恢复),restore=True把遗忘/归档的桶取回。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
-    # --- Delete mode / 删除模式 ---
+    # --- Delete mode (soft) / 删除模式（软删除）---
+    # The file moves to archive/ with a deleted_at stamp; restore=True brings it back.
+    # 文件移入 archive/ 并盖 deleted_at 戳；restore=True 可取回。
     if delete:
         success = await bucket_mgr.delete(bucket_id)
         if success:
             embedding_engine.delete_embedding(bucket_id)
-        return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
+        return (
+            f"已遗忘记忆桶: {bucket_id}（已移入归档，若需取回可用 trace(bucket_id, restore=True)）"
+            if success else f"未找到记忆桶: {bucket_id}"
+        )
+
+    # --- Restore mode / 恢复模式 ---
+    if restore:
+        success = await bucket_mgr.restore(bucket_id)
+        if not success:
+            return f"恢复失败或未找到记忆桶: {bucket_id}"
+        # Rebuild the embedding — it was dropped on delete, so semantic search
+        # would otherwise never surface the restored bucket again.
+        # 重建向量——删除时已丢弃，否则恢复后语义检索永远找不回这个桶。
+        try:
+            restored = await bucket_mgr.get(bucket_id)
+            if restored:
+                await embedding_engine.generate_and_store(bucket_id, restored["content"])
+        except Exception as e:
+            logger.warning(f"Restore embedding rebuild failed / 恢复后重建向量失败: {e}")
+        return f"已取回记忆桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
+
+    # --- Terminal state: say so plainly instead of a generic failure ---
+    # --- 终态：明确告知，不要回一句笼统的「修改失败」---
+    _meta = bucket.get("metadata", {})
+    if _meta.get("type") == "archived" or _meta.get("deleted_at"):
+        return (
+            f"记忆桶 {bucket_id} 已归档/已遗忘，不能直接修改。"
+            f"如需改动请先 trace(bucket_id, restore=True) 取回。"
+        )
 
     # --- Collect only fields actually passed / 只收集用户实际传入的字段 ---
     updates = {}
@@ -1646,6 +1677,7 @@ async def api_trace(request):
             digested=body.get("digested", -1),
             content=body.get("content", ""),
             delete=body.get("delete", False),
+            restore=body.get("restore", False),
         )
         return JSONResponse({"ok": True, "result": result})
     except Exception as e:
@@ -2327,9 +2359,13 @@ async def api_import_review(request):
             elif action == "noise":
                 await bucket_mgr.update(bid, resolved=True, importance=1)
             elif action == "delete":
-                file_path = bucket_mgr._find_bucket_file(bid)
-                if file_path:
-                    os.remove(file_path)
+                # Was a raw os.remove() that bypassed the manager and left the
+                # embedding behind. Route through the (now soft) delete path so
+                # review decisions are reversible and the vector index stays clean.
+                # 这里原本是绕过管理器的裸 os.remove()，还会遗留向量。
+                # 改走（现已软删除的）正规路径：复审决定可撤销，向量索引也保持干净。
+                if await bucket_mgr.delete(bid):
+                    embedding_engine.delete_embedding(bid)
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")

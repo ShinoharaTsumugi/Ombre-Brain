@@ -29,6 +29,7 @@ import os
 import math
 import logging
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,50 @@ from rapidfuzz import fuzz
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, parse_ts, now_diff_days
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+
+def _atomic_write(file_path: str, text: str) -> None:
+    """
+    Write text to file_path atomically.
+    原子写入文件。
+
+    A plain `open(path, "w")` truncates the target to zero length BEFORE
+    writing any bytes. If the process dies inside that window (Zeabur
+    redeploy, OOM kill, SIGKILL), the memory bucket is left empty or
+    half-written — permanent data loss on an irreplaceable file.
+    裸 open(w) 会在写入任何字节之前先把目标文件截断为 0 长度。
+    进程若在这个窗口里被杀掉（Zeabur 重新部署 / OOM / SIGKILL），
+    桶就变成空文件或半截文件——不可替代的记忆永久损坏。
+
+    Instead: write a temp file in the SAME directory (so os.replace stays
+    on one filesystem and is atomic on POSIX), fsync it so the bytes are
+    really on disk, then rename over the target. The target is either the
+    complete old content or the complete new content, never a mix.
+    改为：在同目录写临时文件（保证 os.replace 不跨文件系统、POSIX 上原子），
+    fsync 确保字节真正落盘，再改名覆盖目标。目标要么是完整的旧内容、
+    要么是完整的新内容，不存在中间态。
+
+    The temp file uses a ".tmp" suffix on purpose: every bucket scanner in
+    this module filters on ".md", so a leftover temp file from a crash is
+    invisible to them rather than being picked up as a corrupt bucket.
+    临时文件刻意用 ".tmp" 后缀：本模块所有扫描都按 ".md" 过滤，
+    因此崩溃残留的临时文件不会被当成损坏的桶读进来。
+    """
+    directory = os.path.dirname(file_path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_bucket_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, file_path)
+    except BaseException:
+        # Never leave the temp file behind on failure / 失败时不留残骸
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class BucketManager:
@@ -183,8 +228,7 @@ class BucketManager:
         file_path = safe_path(target_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            _atomic_write(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
             raise
@@ -251,6 +295,25 @@ class BucketManager:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
 
+        # --- Terminal-state guard: archived/deleted buckets are not editable ---
+        # --- 终态守卫：已归档/已删除的桶不可被就地改活 ---
+        # _find_bucket_file deliberately searches archive/ too, and update() had
+        # no terminal check. So trace(id, pinned=1) on a bucket the decay engine
+        # archived last night would hit the auto-move branch below, pull the file
+        # back out of archive/ and re-label it permanent — silently undoing the
+        # decay design. Restoring is a deliberate act: use restore().
+        # _find_bucket_file 有意也搜 archive/，而 update() 原本没有终态检查。
+        # 于是对一个昨夜被衰减引擎归档的 id 调 trace(id, pinned=1)，会命中下面的
+        # 自动移动分支，把文件从 archive/ 拉回来并改标 permanent，静默瓦解衰减设计。
+        # 恢复应当是一个明确的动作：走 restore()。
+        if not kwargs.pop("_allow_terminal", False):
+            if post.get("type") == "archived" or post.get("deleted_at"):
+                logger.info(
+                    f"Refused update on archived/deleted bucket / "
+                    f"拒绝修改已归档或已删除的桶: {bucket_id}"
+                )
+                return False
+
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
         # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
         is_pinned = post.get("pinned", False) or post.get("protected", False)
@@ -287,8 +350,7 @@ class BucketManager:
         post["last_active"] = now_iso()
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            _atomic_write(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
             return False
@@ -301,8 +363,7 @@ class BucketManager:
         domain = post.get("domain", ["未分类"])
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            _atomic_write(file_path, frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
@@ -325,20 +386,51 @@ class BucketManager:
     # ---------------------------------------------------------
     async def delete(self, bucket_id: str) -> bool:
         """
-        Delete a memory bucket file.
-        删除指定的记忆桶文件。
+        Soft-delete a memory bucket: move it to archive/ and stamp deleted_at.
+        软删除记忆桶：移入 archive/ 并盖上 deleted_at 时间戳。
+
+        This used to be os.remove(). A memory bucket is irreplaceable and the
+        only caller is an AI deciding, mid-conversation, that something should
+        be forgotten — an irreversible unlink is the wrong default for that.
+        The file survives in archive/ and can be brought back with restore().
+        这里以前是 os.remove()。记忆桶不可替代，而唯一的调用方是一个在对话中
+        判断「这件事该忘掉」的 AI——对这种场景，不可逆的物理删除是错误的默认。
+        文件保留在 archive/ 中，可用 restore() 取回。
+        """
+        return await self._to_archive(bucket_id, deleted=True)
+
+    async def restore(self, bucket_id: str) -> bool:
+        """
+        Bring an archived or soft-deleted bucket back into circulation.
+        把已归档/已软删除的桶恢复到流通状态。
+
+        Clears deleted_at, re-types the bucket, moves it out of archive/ into
+        permanent/ (if pinned) or dynamic/, and resets last_active so the decay
+        engine doesn't immediately re-archive it on the next cycle.
+        清除 deleted_at，重设类型，把文件移出 archive/ 到 permanent/（若钉选）
+        或 dynamic/，并重置 last_active，避免下一个衰减周期立刻把它再归档。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
 
         try:
-            os.remove(file_path)
-        except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+            post = frontmatter.load(file_path)
+            is_pinned = post.get("pinned", False) or post.get("protected", False)
+            post["type"] = "permanent" if is_pinned else "dynamic"
+            post.metadata.pop("deleted_at", None)
+            # Reset activity so it isn't re-archived on the next decay cycle
+            # 重置活跃时间，免得下个衰减周期又被归档
+            post["last_active"] = now_iso()
+            _atomic_write(file_path, frontmatter.dumps(post))
+
+            target_dir = self.permanent_dir if is_pinned else self.dynamic_dir
+            self._move_bucket(file_path, target_dir, post.get("domain", ["未分类"]))
+        except Exception as e:
+            logger.error(f"Failed to restore bucket / 恢复桶失败: {bucket_id}: {e}")
             return False
 
-        logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
+        logger.info(f"Restored bucket / 恢复记忆桶: {bucket_id}")
         return True
 
     # ---------------------------------------------------------
@@ -363,8 +455,7 @@ class BucketManager:
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            _atomic_write(file_path, frontmatter.dumps(post))
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -413,8 +504,7 @@ class BucketManager:
                     current_count = post.get("activation_count", 1)
                     # Store as float for fractional increments; calculate_score handles it
                     post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
+                    _atomic_write(file_path, frontmatter.dumps(post))
                     rippled += 1
                 except Exception:
                     continue
@@ -699,6 +789,19 @@ class BucketManager:
         """
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
+        Called by the decay engine to simulate forgetting.
+        由衰减引擎调用，模拟遗忘。
+        """
+        return await self._to_archive(bucket_id, deleted=False)
+
+    async def _to_archive(self, bucket_id: str, deleted: bool = False) -> bool:
+        """
+        Shared mover for archive() and delete().
+        archive() 与 delete() 共用的搬运实现。
+
+        deleted=False → decay archiving (natural forgetting)
+        deleted=True  → explicit soft delete, additionally stamps deleted_at
+        两者都只是移动文件，区别仅在于是否盖 deleted_at 戳。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -716,19 +819,26 @@ class BucketManager:
 
             # Update type marker then move file / 更新类型标记后移动文件
             post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            if deleted:
+                post["deleted_at"] = now_iso()
+            _atomic_write(file_path, frontmatter.dumps(post))
 
-            # Use shutil.move for cross-filesystem safety
-            # 使用 shutil.move 保证跨文件系统安全
-            shutil.move(file_path, str(dest))
+            # Already sitting at the destination (e.g. deleting an archived
+            # bucket) — the write above is the whole job, don't move onto self.
+            # 已经在目标位置（例如删除一个本就归档的桶）——上面的写入即全部工作，
+            # 不要自己移到自己上面。
+            if os.path.abspath(file_path) != os.path.abspath(str(dest)):
+                # Use shutil.move for cross-filesystem safety
+                # 使用 shutil.move 保证跨文件系统安全
+                shutil.move(file_path, str(dest))
         except Exception as e:
             logger.error(
                 f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
             )
             return False
 
-        logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
+        verb = "Soft-deleted / 软删除" if deleted else "Archived / 归档"
+        logger.info(f"{verb} bucket: {bucket_id} → archive/{primary_domain}/")
         return True
 
     # ---------------------------------------------------------
