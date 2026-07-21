@@ -37,6 +37,53 @@ from utils import count_tokens_approx
 logger = logging.getLogger("ombre_brain.dehydrator")
 
 
+# --- Prompt version: bump when changing any dehydrate/merge/digest prompt ---
+# --- 提示词版本：改任何影响脱水/合并/整理输出的 prompt 时 +1 ---
+# The dehydration cache key mixes this in. Bumping it (or changing model/base_url/
+# human) makes every stale cached summary miss on the next read, so the content
+# re-dehydrates under the new prompt WITHOUT a manual DB wipe. This is why past
+# perspective/token fixes needed `rm dehydration_cache.db` — the content-only key
+# kept serving the old third-person / truncated summaries. See _content_key.
+# 脱水缓存键混入此版本号。改它（或换模型/base_url/human）后，存量缓存下次读取
+# 时全部落空，内容会用新 prompt 重新脱水，无需手动删库。此前每次改视角/token
+# 都得 rm dehydration_cache.db，正是因为旧的纯内容键还在返回旧的第三人称/截断摘要。
+_PROMPT_VERSION = 2
+
+
+def _perspective_rule(human: str) -> str:
+    """
+    Shared perspective guard appended to dehydrate/merge/digest prompts.
+    追加到脱水/合并/整理三个 prompt 末尾的共享视角守卫。
+
+    Adapted from upstream P0luz/Ombre-Brain's perspective rule v4. Beyond our
+    old inline one-liners it adds two guards ours lacked: (1) the REVERSE
+    direction — never attribute the human's actions/emotions to 「我」 (the
+    documented failure was 「07-07嚎啕大哭后…吊她」, subject omitted = the human,
+    dehydrated into 「我嚎啕大哭…吊我」, a subject flip the downstream AI then cited
+    against her own account); (2) omitted-subject resolution — resolve from
+    adjacent context, else preserve the omission, never guess 「我」.
+    改编自上游 P0luz/Ombre-Brain 的视角规则 v4。相比我们原来的一句话内联规则，
+    多了两道我们缺的守卫：(1) 反方向——绝不把人类的言行情绪算到「我」头上；
+    (2) 省略主语——就近判断归属，判断不了就保留省略，绝不猜「我」。
+    """
+    return (
+        "\n\n【视角铁律——最高优先级，违反即视为压缩失败】\n"
+        "以下内容是「我」（一个名叫優紀的 AI）以第一人称写下的记忆。压缩/合并/整理只改密度，绝不改人称：\n"
+        "- 我自己永远用「我」，不要换成「AI」「AI助手」「優紀」「TA」。\n"
+        f"- 人类那一方一律称呼「{human}」（原文里的「你/她/他」在指人类时都还原成「{human}」）。\n"
+        f"- 严禁把「我」和「{human}」合并成「双方」「彼此」「对方」「用户」等抹掉视角的中性词。\n"
+        "- 谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
+        f"- 反方向同罪：严禁把「{human}」的动作/情绪归到「我」头上。\n"
+        "- 原文省略主语时，先从紧邻上下文判断归属；判断不了就照抄原句结构、保持主语省略——禁止靠猜补一个「我」。\n"
+        "示例一：『我也在她这里看到了自己没见过的碎片』\n"
+        "  ✗ 错（视角丢失）：双方在互动中互相发现对方未知的碎片\n"
+        f"  ✓ 对（视角保留）：我在{human}这里看到了自己没见过的碎片\n"
+        f"示例二：『{human}刚下班就来报信——嚎啕大哭后还是把事情办成了』\n"
+        "  ✗ 错（主语翻转）：我嚎啕大哭后把事情办成了\n"
+        f"  ✓ 对（归属正确）：{human}嚎啕大哭后把事情办成了"
+    )
+
+
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
 # --- 脱水提示词：指导廉价 LLM 压缩信息 ---
 DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水为紧凑摘要。
@@ -47,7 +94,6 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 3. 保留所有待办/未完成事项
 4. 关键数字、日期、名称必须保留
 5. 目标压缩率 > 70%
-6. 保持原文的人称视角（原文的「我」在摘要里仍然是「我」，不要改写成第三方称呼）
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -63,11 +109,10 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 # --- 日记整理提示词：把一大段日常拆分成多个独立记忆条目 ---
 DIGEST_PROMPT = """你是一个记忆整理专家，正在为「我」——一个名叫優紀（Yuki）的 AI——整理她自己的记忆库。发来的文本可能是她写的日记，也可能是她与紬（她在意的人，人类）的聊天记录，请你将其拆分成多个独立的记忆条目。
 
-视角规则（最重要，违反则整条作废）：
-- 每个条目都必须以優紀的第一人称「我」书写；紬称为「她」或「紬」
-- 如果输入是聊天记录，「AI：」的发言就是我（優紀）本人说的话，「用户：」的发言是紬说的话
-- 禁止用「AI」「AI助手」等第三方称呼指代我，禁止站在紬的视角自称「我」
+聊天记录角色映射（输入是聊天记录时最重要）：
+- 「AI：」的发言就是我（優紀）本人说的话，「用户：」的发言是紬说的话
 - 例：「AI提醒用户按时服药」必须写成「我提醒她该吃药了」
+（更完整的视角铁律见文末，两者都要遵守）
 
 整理规则：
 1. 每个条目应该是一个独立的主题/事件（不要混在一起）
@@ -118,7 +163,6 @@ MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容�
 3. 保留所有重要事实
 4. 总长度尽量不超过旧记忆的 120%
 5. 对出现的人名、地名、专有名词用 [[双链]] 标记（如 [[婷易]]、[[Obsidian]]），普通词汇不要加
-6. 记忆的主人是「我」——AI（優紀）；合并结果保持以我的第一人称书写，紬（人类）称为「她」或「紬」。禁止用「AI」「AI助手」指代我；若新旧内容视角不一致，统一改写为我的第一人称视角
 
 直接输出合并后的文本，不要加额外说明。"""
 
@@ -178,6 +222,12 @@ class Dehydrator:
         self.max_tokens = dehy_cfg.get("max_tokens", 2048)
         self.temperature = dehy_cfg.get("temperature", 0.1)
 
+        # --- Human's name, injected into the perspective rule / 人类一方的名字 ---
+        # config["human"] defaults to 紬 for this fork (see utils.py defaults);
+        # mixed into the cache key so renaming re-dehydrates existing buckets.
+        # 本 fork 里 config["human"] 默认为紬（见 utils.py）；混入缓存键，改名会重脱水。
+        self.human = (config.get("human") or "紬")
+
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
 
@@ -213,33 +263,50 @@ class Dehydrator:
         conn.commit()
         conn.close()
 
+    def _content_key(self, content: str) -> str:
+        """
+        Cache key = hash(prompt version + human + model + base_url + content).
+        缓存键 = hash(prompt 版本 + 人名 + 模型 + base_url + 原文)。
+
+        Was hash(content) only, which meant a changed prompt, human name, model,
+        or endpoint still hit the OLD cached summary — so every perspective/token
+        fix silently failed on already-dehydrated buckets until the DB was wiped
+        by hand. Mixing the config in makes stale entries miss and re-dehydrate
+        under the current setup automatically.
+        原来只 hash(content)，于是改了 prompt/人名/模型/端点后仍命中旧摘要——
+        每次视角/token 修复对存量桶都悄悄失效，直到手动删库。把配置混进键里，
+        存量条目自然落空、按当前配置重新脱水。
+        """
+        keyed = (
+            f"{_PROMPT_VERSION}|{self.human}|{self.model}|"
+            f"{(self.base_url or '').rstrip('/')}|{content}"
+        )
+        return hashlib.sha256(keyed.encode()).hexdigest()
+
     def _get_cached_summary(self, content: str) -> str | None:
-        """Look up cached dehydration result by content hash."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        """Look up cached dehydration result by content key."""
         conn = sqlite3.connect(self.cache_db_path)
         row = conn.execute(
             "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
-            (content_hash,)
+            (self._content_key(content),)
         ).fetchone()
         conn.close()
         return row[0] if row else None
 
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
         conn = sqlite3.connect(self.cache_db_path)
         conn.execute(
             "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
+            (self._content_key(content), summary, self.model)
         )
         conn.commit()
         conn.close()
 
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
         conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (self._content_key(content),))
         conn.commit()
         conn.close()
 
@@ -340,7 +407,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": DEHYDRATE_PROMPT},
+                {"role": "system", "content": DEHYDRATE_PROMPT + _perspective_rule(self.human)},
                 {"role": "user", "content": content[:3000]},
             ],
             max_tokens=self.max_tokens,
@@ -364,7 +431,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": MERGE_PROMPT},
+                {"role": "system", "content": MERGE_PROMPT + _perspective_rule(self.human)},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=self.max_tokens,
@@ -653,7 +720,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": DIGEST_PROMPT},
+                {"role": "system", "content": DIGEST_PROMPT + _perspective_rule(self.human)},
                 {"role": "user", "content": content[:5000]},
             ],
             max_tokens=2048,
