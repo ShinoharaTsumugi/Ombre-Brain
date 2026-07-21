@@ -34,6 +34,7 @@
 
 import os
 import sys
+import re
 import random
 import logging
 import asyncio
@@ -651,10 +652,35 @@ async def breath(
     max_results: int = 20,
     importance_min: int = -1,
 ) -> str:
-    """breath - 检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """breath - 检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。传单个完整bucket_id(12位十六进制)=返回该桶未压缩的原文(改content前先这样读原文,别拿摘要覆盖)。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
+
+    # --- Raw by-ID mode: query is exactly a bucket_id → return VERBATIM content ---
+    # --- 原文按ID模式：query 恰好是一个 bucket_id → 返回未压缩、未去链的原文 ---
+    # Every other read path in this file dehydrates (breath/dream/pulse) or
+    # strips wikilinks, so an AI that reads a bucket then calls
+    # trace(content=<what it read>) overwrites the true source with a lossy
+    # summary. This gives a faithful read path to use BEFORE editing content.
+    # 本文件其余每条读取路径都会脱水（breath/dream/pulse）或去掉双链，
+    # 于是 AI 读完再 trace(content=<刚读到的>) 就会用有损摘要覆盖原文。
+    # 这里提供一条忠实的读取路径，供改 content 之前先读原文用。
+    _q = query.strip()
+    if _q and re.fullmatch(r"[0-9a-f]{12}", _q):
+        bucket = await bucket_mgr.get(_q)
+        if bucket:
+            meta = bucket.get("metadata", {})
+            header = (
+                f"[bucket_id:{_q}] [{meta.get('name', _q)}] "
+                f"[原文·未压缩] 主题:{','.join(meta.get('domain', []))} "
+                f"重要:{meta.get('importance', '?')}"
+            )
+            if meta.get("type") == "archived" or meta.get("deleted_at"):
+                header += " [已归档/已遗忘]"
+            return f"{header}\n{bucket.get('content', '')}"
+        # not a real id → fall through to normal keyword search
+        # 不是真实 id → 继续走普通关键词检索
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
@@ -1158,8 +1184,9 @@ async def trace(
     content: str = "",
     delete: bool = False,
     restore: bool = False,
+    force: bool = False,
 ) -> str:
-    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True遗忘(可恢复),restore=True把遗忘/归档的桶取回。只传需改的,-1或空=不改。"""
+    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文(会整体替换,改前先用breath(bucket_id)读原文,别拿摘要覆盖),delete=True遗忘(可恢复),restore=True把遗忘/归档的桶取回,force=True确认要用明显更短的内容覆盖原文。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1228,6 +1255,30 @@ async def trace(
     if digested in (0, 1):
         updates["digested"] = bool(digested)
     if content:
+        # --- Shrink guard: refuse to overwrite a bucket with a much shorter body ---
+        # --- 缩水守卫：拒绝用明显更短的正文覆盖原文 ---
+        # The failure mode: an AI reads a bucket via breath/dream/pulse (which
+        # return a DEHYDRATED summary), then calls trace(content=<that summary>).
+        # A ~150-char summary silently replaces an ~800-char irreplaceable
+        # original. content= is a whole-body replace, not a merge. So if the new
+        # body is a lot shorter than the current one, stop and make it explicit —
+        # tell them to read the raw text first (breath with the bucket_id) or pass
+        # force=True if the shrink is genuinely intended (a real trim/correction).
+        # 失效模式：AI 用 breath/dream/pulse 读桶（返回的是脱水摘要），再
+        # trace(content=<那段摘要>)，于是 ~150 字的摘要悄悄覆盖 ~800 字、
+        # 不可替代的原文。content= 是整体替换不是合并。因此当新正文远短于
+        # 当前正文时，拦下并说清楚——让它先用 breath(bucket_id) 读原文，
+        # 或在确属有意精简/更正时传 force=True。
+        old_content = bucket.get("content", "") or ""
+        old_len, new_len = len(old_content.strip()), len(content.strip())
+        SHRINK_FLOOR = 200      # 原文太短就不值得守卫，正常编辑放行
+        SHRINK_RATIO = 0.5      # 新正文短于原文一半 → 视为可疑覆盖
+        if not force and old_len >= SHRINK_FLOOR and new_len < old_len * SHRINK_RATIO:
+            return (
+                f"已拦截：新正文（{new_len}字）明显短于原文（{old_len}字），疑似拿摘要覆盖原文。\n"
+                f"改前请先用 breath(\"{bucket_id}\") 读未压缩的原文；\n"
+                f"若确实是有意精简/更正，再带 force=True 重试。原文未改动。"
+            )
         updates["content"] = content
 
     if not updates:
@@ -1678,6 +1729,7 @@ async def api_trace(request):
             content=body.get("content", ""),
             delete=body.get("delete", False),
             restore=body.get("restore", False),
+            force=body.get("force", False),
         )
         return JSONResponse({"ok": True, "result": result})
     except Exception as e:
@@ -1803,10 +1855,20 @@ async def api_bucket_detail(request):
     if not bucket:
         return JSONResponse({"error": "not found"}, status_code=404)
     meta = bucket.get("metadata", {})
+    # ?raw=1 → return VERBATIM content (with [[wikilinks]]) for round-trip-safe
+    # reads. Default stays stripped for the dashboard's read-only detail view.
+    # Stripping is display-only sugar; any consumer that intends to write the
+    # content back must read with raw=1, or it silently drops every wikilink
+    # (and /api/network builds its graph from those links).
+    # ?raw=1 → 返回未去链的原文，供需要写回的忠实读取。默认仍去链，
+    # 供 dashboard 只读详情展示。去链只是展示层糖；任何打算把 content 写回的
+    # 消费方都必须用 raw=1 读，否则会悄悄丢掉所有双链（/api/network 靠它构图）。
+    raw = request.query_params.get("raw", "") in ("1", "true", "yes")
+    body = bucket.get("content", "")
     return JSONResponse({
         "id": bucket["id"],
         "metadata": meta,
-        "content": strip_wikilinks(bucket.get("content", "")),
+        "content": body if raw else strip_wikilinks(body),
         "score": decay_engine.calculate_score(meta),
     })
 
