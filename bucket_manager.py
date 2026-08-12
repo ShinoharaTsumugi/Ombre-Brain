@@ -366,6 +366,17 @@ class BucketManager:
             _atomic_write(file_path, frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
 
+        # --- Auto-move (mirror): unpin → back to dynamic/ ---
+        # --- 自动移动（镜像）：取消钉选 → 搬回 dynamic/ ---
+        # 此前只有「钉上→搬进 permanent/」的单向分支：unpin 只翻元数据，文件滞留
+        # permanent/、type 不变 → 固化计数永不下降（2026-08-04 用户报告）。
+        # protected 桶不受影响（protected 独立于 pinned，仍留在 permanent/）。
+        if ("pinned" in kwargs and not kwargs["pinned"]
+                and post.get("type") == "permanent" and not post.get("protected")):
+            post["type"] = "dynamic"
+            _atomic_write(file_path, frontmatter.dumps(post))
+            self._move_bucket(file_path, self.dynamic_dir, domain)
+
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
 
@@ -819,6 +830,11 @@ class BucketManager:
 
             # Update type marker then move file / 更新类型标记后移动文件
             post["type"] = "archived"
+            # 归档即摘钉：归档桶带着 pinned=true 会污染 📌 计数/列表，而终态守卫
+            # 又使其无法再被 unpin（2026-08-04 曾人工清理 37 个此类残留）。
+            # restore 之后如仍需钉选，显式再 pin 一次即可。
+            if post.get("pinned"):
+                post["pinned"] = False
             if deleted:
                 post["deleted_at"] = now_iso()
             _atomic_write(file_path, frontmatter.dumps(post))
