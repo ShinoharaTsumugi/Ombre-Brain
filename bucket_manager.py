@@ -43,20 +43,79 @@ from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, parse_t
 logger = logging.getLogger("ombre_brain.bucket")
 
 
-# --- 进程内桶索引缓存(2026-08-13 breath 提速第二轮) ---
+# --- 进程内桶索引缓存(2026-08-13 二轮建立,三轮改定点刷新) ---
 # 检索路径原本每次全库磁盘扫描(list_all ~400 个 frontmatter 解析,breath 计时里 search=2.4s 的大头),
-# 向量通道每个命中还要 _find_bucket_file 再全库 walk 一次(vector=1.7s 的全部)。
-# 进程内索引:写路径两个咽喉(_atomic_write / _move_bucket)主动失效 + 15s TTL 兜底防漏网写点。
-# 单容器部署前提下安全;多副本最多读到 15s 旧索引。list_all 返回逐桶浅拷贝(顶层+metadata 一层),
+# 向量通道每个命中还要 _find_bucket_file 再全库 walk 一次。
+# 二轮在写咽喉全量失效 + 15s TTL,但一轮的延后 touch 在每次 breath 响应后 ~2s 内
+# 批量写 8 个桶(touch 本体+时间涟漪),每次写都全量失效 → 索引刚建就被打掉,
+# 永远活不到下一次调用(自杀环)。三轮改为定点刷新:写哪个文件就只重解析哪个文件、
+# 替换/追加对应索引项,解析失败才退回全量失效;TTL 拉长为纯保险丝,兜未来漏网写点。
+# 单容器部署前提下安全。list_all 返回逐桶浅拷贝(顶层+metadata 一层),
 # 调用方写 score/vector_match/情绪偏移不会污染缓存;content 字符串不可变,共享无碍。
-_INDEX_TTL = 15.0
+_INDEX_TTL = 600.0
 _index_cache: dict = {"ts": 0.0, "entries": None, "paths": None}
+_ARCHIVE_DIR: Optional[str] = None  # BucketManager.__init__ 登记,定点刷新判 archive 归属用
 
 
 def _invalidate_index() -> None:
     _index_cache["ts"] = 0.0
     _index_cache["entries"] = None
     _index_cache["paths"] = None
+
+
+def _load_bucket_file(file_path: str) -> Optional[dict]:
+    """
+    Parse a Markdown file and return structured bucket data.
+    解析 Markdown 文件，返回桶的结构化数据。(从 BucketManager._load_bucket
+    提取为模块级,定点刷新在无实例的 _atomic_write 里也要用。)
+    """
+    try:
+        post = frontmatter.load(file_path)
+        return {
+            "id": post.get("id", Path(file_path).stem),
+            "metadata": dict(post.metadata),
+            "content": post.content,
+            "path": file_path,
+        }
+    except Exception as e:
+        logger.warning(
+            f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
+        )
+        return None
+
+
+def _index_refresh_file(file_path: str, old_path: str = None) -> None:
+    """
+    定点刷新:重解析 file_path 替换/追加索引项;old_path 给出时先移除旧路径项
+    (移动/归档场景)。索引未建立时无事可做;归属按路径是否在 archive/ 下判定;
+    解析失败或无法判归属时退回全量失效(保守兜底,行为等价二轮)。
+    """
+    entries = _index_cache["entries"]
+    if entries is None:
+        return
+    # create/_move_bucket 经 safe_path 拿到的是 Path 对象;索引统一存 str,
+    # 避免 entries/paths 里 str 与 PosixPath 混存导致下游字符串操作炸掉。
+    file_path = str(file_path)
+    if old_path is not None:
+        old_path = str(old_path)
+    try:
+        bucket = _load_bucket_file(file_path)
+        if bucket is None or _ARCHIVE_DIR is None:
+            _invalidate_index()
+            return
+        is_archive = os.path.normpath(file_path).startswith(_ARCHIVE_DIR + os.sep)
+        drop = {os.path.normpath(file_path)}
+        if old_path:
+            drop.add(os.path.normpath(old_path))
+        entries[:] = [
+            (b, a) for b, a in entries
+            if os.path.normpath(b["path"]) not in drop
+        ]
+        entries.append((bucket, is_archive))
+        if _index_cache["paths"] is not None:
+            _index_cache["paths"][bucket["id"]] = file_path
+    except Exception:
+        _invalidate_index()
 
 
 def _atomic_write(file_path: str, text: str) -> None:
@@ -94,7 +153,7 @@ def _atomic_write(file_path: str, text: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, file_path)
-        _invalidate_index()
+        _index_refresh_file(file_path)
     except BaseException:
         # Never leave the temp file behind on failure / 失败时不留残骸
         try:
@@ -154,6 +213,10 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+
+        # --- 登记 archive 目录供模块级定点刷新判归属(单例部署,重复实例化以最后一个为准) ---
+        global _ARCHIVE_DIR
+        _ARCHIVE_DIR = os.path.normpath(self.archive_dir)
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -291,7 +354,7 @@ class BucketManager:
         if os.path.normpath(file_path) != os.path.normpath(new_path):
             os.rename(file_path, new_path)
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
-            _invalidate_index()
+            _index_refresh_file(new_path, old_path=file_path)
         return new_path
 
     # ---------------------------------------------------------
@@ -876,6 +939,9 @@ class BucketManager:
                 # Use shutil.move for cross-filesystem safety
                 # 使用 shutil.move 保证跨文件系统安全
                 shutil.move(file_path, str(dest))
+                # 这里绕过 _move_bucket 直接 move,二轮靠上面 _atomic_write 的全量
+                # 失效兜住;定点化后必须自己补刷,否则索引项指向已消失的旧路径。
+                _index_refresh_file(str(dest), old_path=file_path)
         except Exception as e:
             logger.error(
                 f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
@@ -931,18 +997,6 @@ class BucketManager:
     def _load_bucket(self, file_path: str) -> Optional[dict]:
         """
         Parse a Markdown file and return structured bucket data.
-        解析 Markdown 文件，返回桶的结构化数据。
+        解析 Markdown 文件，返回桶的结构化数据。(实现在模块级 _load_bucket_file。)
         """
-        try:
-            post = frontmatter.load(file_path)
-            return {
-                "id": post.get("id", Path(file_path).stem),
-                "metadata": dict(post.metadata),
-                "content": post.content,
-                "path": file_path,
-            }
-        except Exception as e:
-            logger.warning(
-                f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
-            )
-            return None
+        return _load_bucket_file(file_path)
