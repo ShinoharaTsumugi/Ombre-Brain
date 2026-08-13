@@ -149,7 +149,18 @@ class EmbeddingEngine:
             return []
 
         try:
-            query_embedding = await self._generate_embedding(query)
+            # query 嵌入缓存:同一次 breath 里 query 会被嵌入两次(搜索预筛+向量通道),
+            # 跨轮重复 query 也命中;嵌入确定性,语义零变化。
+            cache = getattr(self, "_query_emb_cache", None)
+            if cache is None:
+                cache = self._query_emb_cache = {}
+            query_embedding = cache.get(query)
+            if query_embedding is None:
+                query_embedding = await self._generate_embedding(query)
+                if query_embedding:
+                    if len(cache) >= 64:
+                        cache.clear()
+                    cache[query] = query_embedding
             if not query_embedding:
                 return []
         except Exception as e:

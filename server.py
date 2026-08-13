@@ -103,6 +103,27 @@ async def _fire_webhook(event: str, payload: dict) -> None:
     except Exception as e:
         logger.warning(f"Webhook push failed ({event} → {OMBRE_HOOK_URL}): {e}")
 
+
+_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro) -> None:
+    """后台任务安全出生点:保引用防 GC,完成即释放。"""
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+
+
+async def _touch_batch(ids: list) -> None:
+    """检索命中的 touch(last_active/涟漪)挪到响应之后执行——数学不变,只改时机。"""
+    _t0 = time.monotonic()
+    for bid in ids:
+        try:
+            await bucket_mgr.touch(bid)
+        except Exception as e:
+            logger.warning(f"deferred touch failed for {bid}: {e}")
+    logger.info(f"breath deferred touch: n={len(ids)} ms={int((time.monotonic()-_t0)*1000)}")
+
 # --- Initialize core components / 初始化核心组件 ---
 embedding_engine = EmbeddingEngine(config)            # Embedding engine first (BucketManager depends on it)
 bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
@@ -862,6 +883,7 @@ async def breath(
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
+    _bt0 = time.monotonic()
     try:
         matches = await bucket_mgr.search(
             query,
@@ -873,6 +895,7 @@ async def breath(
     except Exception as e:
         logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
+    _t_search = time.monotonic() - _bt0
 
     # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
     # --- 搜索模式排除钉选桶（它们在浮现模式中始终可见）---
@@ -881,6 +904,7 @@ async def breath(
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
     matched_ids = {b["id"] for b in matches}
+    _bt1 = time.monotonic()
     try:
         vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
         for bucket_id, sim_score in vector_results:
@@ -894,8 +918,12 @@ async def breath(
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
 
+    _t_vector = time.monotonic() - _bt1
     results = []
     token_used = 0
+    _touch_ids = []
+    _t_dehy = 0.0
+    _n_miss = 0
     for bucket in matches:
         if token_used >= max_tokens:
             break
@@ -907,11 +935,16 @@ async def breath(
                 original_v = float(clean_meta.get("valence", 0.5))
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
+            _dt0 = time.monotonic()
             summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+            _dt = time.monotonic() - _dt0
+            _t_dehy += _dt
+            if _dt > 0.2:
+                _n_miss += 1
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            await bucket_mgr.touch(bucket["id"])
+            _touch_ids.append(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
@@ -924,6 +957,7 @@ async def breath(
 
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
     # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
+    _bt2 = time.monotonic()
     if len(matches) < 3 and random.random() < 0.4:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -944,12 +978,21 @@ async def breath(
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
+    _t_drift = time.monotonic() - _bt2
+    if _touch_ids:
+        _spawn_bg(_touch_batch(_touch_ids))
+    _timing = (f"breath timing ms: total={int((time.monotonic()-_bt0)*1000)} "
+               f"search={int(_t_search*1000)} vector={int(_t_vector*1000)} "
+               f"dehy={int(_t_dehy*1000)} drift={int(_t_drift*1000)} "
+               f"n={len(results)} miss~={_n_miss}")
     if not results:
-        await _fire_webhook("breath", {"mode": "empty", "matches": 0})
+        _spawn_bg(_fire_webhook("breath", {"mode": "empty", "matches": 0}))
+        logger.info(_timing + " chars=0")
         return "未找到相关记忆。"
 
     final_text = "\n\n".join(results)
-    await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
+    _spawn_bg(_fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)}))
+    logger.info(_timing + f" chars={len(final_text)}")
     return final_text
 
 
