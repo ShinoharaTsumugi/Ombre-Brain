@@ -30,6 +30,7 @@ import math
 import logging
 import shutil
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,22 @@ from rapidfuzz import fuzz
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, parse_ts, now_diff_days
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+
+# --- 进程内桶索引缓存(2026-08-13 breath 提速第二轮) ---
+# 检索路径原本每次全库磁盘扫描(list_all ~400 个 frontmatter 解析,breath 计时里 search=2.4s 的大头),
+# 向量通道每个命中还要 _find_bucket_file 再全库 walk 一次(vector=1.7s 的全部)。
+# 进程内索引:写路径两个咽喉(_atomic_write / _move_bucket)主动失效 + 15s TTL 兜底防漏网写点。
+# 单容器部署前提下安全;多副本最多读到 15s 旧索引。list_all 返回逐桶浅拷贝(顶层+metadata 一层),
+# 调用方写 score/vector_match/情绪偏移不会污染缓存;content 字符串不可变,共享无碍。
+_INDEX_TTL = 15.0
+_index_cache: dict = {"ts": 0.0, "entries": None, "paths": None}
+
+
+def _invalidate_index() -> None:
+    _index_cache["ts"] = 0.0
+    _index_cache["entries"] = None
+    _index_cache["paths"] = None
 
 
 def _atomic_write(file_path: str, text: str) -> None:
@@ -77,6 +94,7 @@ def _atomic_write(file_path: str, text: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, file_path)
+        _invalidate_index()
     except BaseException:
         # Never leave the temp file behind on failure / 失败时不留残骸
         try:
@@ -273,6 +291,7 @@ class BucketManager:
         if os.path.normpath(file_path) != os.path.normpath(new_path):
             os.rename(file_path, new_path)
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
+            _invalidate_index()
         return new_path
 
     # ---------------------------------------------------------
@@ -728,25 +747,35 @@ class BucketManager:
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
         """
-        buckets = []
-
-        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
-        if include_archive:
-            dirs.append(self.archive_dir)
-
-        for dir_path in dirs:
-            if not os.path.exists(dir_path):
-                continue
-            for root, _, files in os.walk(dir_path):
-                for filename in files:
-                    if not filename.endswith(".md"):
-                        continue
-                    file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
-                    if bucket:
-                        buckets.append(bucket)
-
-        return buckets
+        now = time.monotonic()
+        if _index_cache["entries"] is None or now - _index_cache["ts"] >= _INDEX_TTL:
+            entries = []
+            paths = {}
+            for dir_path, is_archive in [
+                (self.permanent_dir, False),
+                (self.dynamic_dir, False),
+                (self.feel_dir, False),
+                (self.archive_dir, True),
+            ]:
+                if not os.path.exists(dir_path):
+                    continue
+                for root, _, files in os.walk(dir_path):
+                    for filename in files:
+                        if not filename.endswith(".md"):
+                            continue
+                        file_path = os.path.join(root, filename)
+                        bucket = self._load_bucket(file_path)
+                        if bucket:
+                            entries.append((bucket, is_archive))
+                            paths[bucket["id"]] = file_path
+            _index_cache["entries"] = entries
+            _index_cache["paths"] = paths
+            _index_cache["ts"] = now
+        return [
+            {**b, "metadata": dict(b["metadata"])}
+            for b, is_arch in _index_cache["entries"]
+            if include_archive or not is_arch
+        ]
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)
@@ -862,6 +891,18 @@ class BucketManager:
     # 内部：在三个目录中查找桶文件
     # ---------------------------------------------------------
     def _find_bucket_file(self, bucket_id: str) -> Optional[str]:
+        """索引缓存快路径;miss 落回全库扫描并回填索引。"""
+        paths = _index_cache["paths"]
+        if paths is not None and time.monotonic() - _index_cache["ts"] < _INDEX_TTL:
+            p = paths.get(bucket_id)
+            if p and os.path.exists(p):
+                return p
+        p = self._find_bucket_file_slow(bucket_id)
+        if p and _index_cache["paths"] is not None:
+            _index_cache["paths"][bucket_id] = p
+        return p
+
+    def _find_bucket_file_slow(self, bucket_id: str) -> Optional[str]:
         """
         Recursively search permanent/dynamic/archive for a bucket file
         matching the given ID.
