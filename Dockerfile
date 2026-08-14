@@ -31,4 +31,6 @@ ENV OMBRE_BUCKETS_DIR=/app/buckets
 
 EXPOSE 8000
 
-CMD ["python", "server.py"]
+# mcp_auth = server.py 全量 + /mcp Bearer 鉴权 + 连接器秘密路径（勿改回裸 server.py，
+# 否则 MCP 端点无鉴权裸奔——2026-08-14 迁移事故的根因）
+CMD ["python", "mcp_auth.py"]

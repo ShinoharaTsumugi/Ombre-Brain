@@ -98,3 +98,17 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+if __name__ == "__main__":
+    # 直接作为容器入口（Dockerfile: CMD ["python", "mcp_auth.py"]）：
+    # = server.py 的全部能力 + /mcp Bearer 鉴权门 + 连接器秘密路径。
+    # 2026-08-14 教训：迁移到 Git 构建后 CMD 曾是裸 server.py，中间件没跑，
+    # /mcp 在公网裸奔了一天——鉴权入口必须就是默认入口，不靠平台自定义启动命令。
+    import uvicorn
+
+    try:
+        port = int(os.environ.get("OMBRE_PORT", "8000") or "8000")
+    except ValueError:
+        port = 8000
+    uvicorn.run(app, host="0.0.0.0", port=port)
