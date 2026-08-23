@@ -621,6 +621,7 @@
 
 <div class="content" id="list-view">
   <div class="filters" id="filters"></div>
+  <div class="filters" id="sorts"></div>
   <div class="bucket-list" id="bucket-list">
     <div class="loading">加载中…</div>
   </div>
@@ -1036,6 +1037,9 @@ async function authFetch(url, options) {
 const BASE = location.origin;
 let allBuckets = [];
 let currentFilter = 'all';
+let currentSort = 'score';   // score=权重(接口默认序) / newest / oldest
+
+function rerender() { renderBuckets(sortBuckets(filterBuckets(allBuckets))); }
 
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -1061,7 +1065,7 @@ document.getElementById('search-input').addEventListener('input', (e) => {
   const q = e.target.value.trim();
   searchTimer = setTimeout(() => {
     if (q) searchBuckets(q);
-    else renderBuckets(allBuckets);
+    else rerender();
   }, 300);
 });
 
@@ -1075,7 +1079,7 @@ async function loadBuckets() {
     allBuckets = data;
     updateStats();
     buildFilters();
-    renderBuckets(allBuckets);
+    rerender();
   } catch (e) {
     document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
@@ -1115,8 +1119,42 @@ function buildFilters() {
     filters.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
     btn.classList.add('active');
     currentFilter = btn.dataset.filter;
-    renderBuckets(filterBuckets(allBuckets));
+    rerender();
   });
+
+  // ── 排序切换：权重(默认) / 最新 / 最早 ──
+  const sorts = document.getElementById('sorts');
+  sorts.innerHTML = [
+    { key: 'score', label: '⚖️ 权重' },
+    { key: 'newest', label: '🕐 最新' },
+    { key: 'oldest', label: '🕰 最早' },
+  ].map(function(s) {
+    return '<button class="filter-btn ' + (s.key === currentSort ? 'active' : '') + '" data-sort="' + s.key + '">' + s.label + '</button>';
+  }).join('');
+  sorts.addEventListener('click', function(e) {
+    var btn = e.target.closest('.filter-btn');
+    if (!btn) return;
+    sorts.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    currentSort = btn.dataset.sort;
+    rerender();
+  });
+}
+
+// created 是带时区偏移的 ISO 串（上海时期 +08:00、悉尼时期 +10:00 混存），
+// 必须 Date.parse 按绝对时间比较——直接字符串排序在跨时区处会错序
+function sortBuckets(buckets) {
+  var arr = buckets.slice();
+  if (currentSort === 'newest' || currentSort === 'oldest') {
+    arr.sort(function(a, b) {
+      var ta = a.created ? Date.parse(a.created) : 0;
+      var tb = b.created ? Date.parse(b.created) : 0;
+      return currentSort === 'newest' ? tb - ta : ta - tb;
+    });
+  } else {
+    arr.sort(function(a, b) { return (b.score || 0) - (a.score || 0); });
+  }
+  return arr;
 }
 
 function filterBuckets(buckets) {
