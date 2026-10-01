@@ -136,6 +136,12 @@ class TestFeelLifecycle:
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(fm.dumps(post))
 
+        # Files were rewritten behind the manager's back: drop the module-level
+        # index cache, or list_all() keeps serving the pre-patch timestamps (flaky).
+        # 绕过管理器直接改了文件:要清掉模块级索引缓存,否则 list_all() 还是旧时间戳(随机挂)。
+        import bucket_manager
+        bucket_manager._invalidate_index()
+
         all_b = await bm.list_all()
         feels = [b for b in all_b if b["metadata"].get("type") == "feel"]
         feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)

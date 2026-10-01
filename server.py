@@ -398,15 +398,41 @@ async def root_redirect(request):
     return RedirectResponse(url="/dashboard")
 
 
+_PROCESS_T0 = time.monotonic()
+
+
+def _process_rss_mb():
+    """当前进程常驻内存(MB)。Linux 读 /proc,其他平台退回 getrusage;拿不到返回 None。"""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(ru / 1024 / 1024, 1) if sys.platform == "darwin" else round(ru / 1024, 1)
+    except Exception:
+        return None
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import JSONResponse
     try:
         stats = await bucket_mgr.get_stats()
+        # rss_mb / uptime_s:节点只有 2GB,被驱逐过一次(2026-09-29);从外面能看到
+        # 进程吃了多少、活了多久,才分得清"自己变重了"和"机器上别人在抢"。
+        vec_cache = getattr(embedding_engine, "_vec_cache", None)
         return JSONResponse({
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "rss_mb": _process_rss_mb(),
+            "uptime_s": int(time.monotonic() - _PROCESS_T0),
+            "vec_cache_rows": len(vec_cache) if vec_cache is not None else None,
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -1519,25 +1545,34 @@ async def dream() -> str:
         try:
             feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
             if len(feels) >= 3:
-                feel_embeddings = {}
-                for f in feels:
-                    emb = await embedding_engine.get_embedding(f["id"])
-                    if emb is not None:
-                        feel_embeddings[f["id"]] = emb
                 # Find clusters: feels with similarity > 0.7 to at least 2 others
-                for fid, femb in feel_embeddings.items():
-                    similar_feels = []
-                    for oid, oemb in feel_embeddings.items():
-                        if oid != fid:
-                            sim = embedding_engine._cosine_similarity(femb, oemb)
-                            if sim > 0.7:
-                                similar_feels.append(oid)
-                    if len(similar_feels) >= 2:
-                        feel_bucket = next((f for f in feels if f["id"] == fid), None)
+                # 两两相似度走归一化矩阵一次点积;原先对每条 feel get_embedding().tolist()
+                # 再纯 Python 两两算余弦,feel 数量平方级增长(现 ~100 条 → 每次 dream 卡几秒)。
+                # 没有 numpy 时退回逐条算,结果一致。
+                by_id = {f["id"]: f for f in feels}
+                present, sims = embedding_engine.similarity_matrix([f["id"] for f in feels])
+                if sims is not None:
+                    counts = [(fid, int((sims[i] > 0.7).sum()) - 1) for i, fid in enumerate(present)]  # 减掉自己
+                else:
+                    feel_embeddings = {}
+                    for f in feels:
+                        emb = await embedding_engine.get_embedding(f["id"])
+                        if emb is not None:
+                            feel_embeddings[f["id"]] = emb
+                    counts = []
+                    for fid, femb in feel_embeddings.items():
+                        n_sim = sum(
+                            1 for oid, oemb in feel_embeddings.items()
+                            if oid != fid and embedding_engine._cosine_similarity(femb, oemb) > 0.7
+                        )
+                        counts.append((fid, n_sim))
+                for fid, n_similar in counts:
+                    if n_similar >= 2:
+                        feel_bucket = by_id.get(fid)
                         if feel_bucket and not feel_bucket["metadata"].get("pinned"):
                             content_preview = strip_wikilinks(feel_bucket["content"][:80])
                             crystal_hint = (
-                                f"\n🔮 你已经写过 {len(similar_feels)+1} 条相似的 feel "
+                                f"\n🔮 你已经写过 {n_similar+1} 条相似的 feel "
                                 f"（围绕「{content_preview}…」）。"
                                 f"如果这已经是确信而不只是感受了，"
                                 f"你可以用 hold(content=\"...\", pinned=True) 升级它。"
@@ -1944,18 +1979,61 @@ async def api_search(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _network_edges(ids: list, min_sim: float, k: int) -> list:
+    """
+    关系图的边:每个桶只保留余弦最高的 k 个邻居(且 ≥ min_sim),去重后返回
+    [{source, target, similarity}]。相似度来自归一化矩阵一次点积。
+    原实现对每个桶 get_embedding().tolist() 再纯 Python 两两算余弦、阈值 0.5:
+    1500+ 桶时多占 ~150MB、卡住事件循环好几分钟;而随机两桶余弦中位就有 0.68、
+    P99 0.81(2026-09-29 实测),0.5 等于把全库连成一团(百万条边)。
+    """
+    if not (embedding_engine and embedding_engine.enabled):
+        return []
+    present, sims = embedding_engine.similarity_matrix(ids)
+    if sims is None or len(present) < 2:
+        return []
+    try:
+        import numpy as np
+    except ImportError:
+        return []
+    n = len(present)
+    s = np.array(sims, dtype=np.float32, copy=True)
+    np.fill_diagonal(s, -1.0)
+    kk = max(1, min(k, n - 1))
+    nbr = np.argpartition(-s, kk - 1, axis=1)[:, :kk]  # 每行余弦最大的 kk 个下标
+    seen = set()
+    edges = []
+    for i in range(n):
+        for j in nbr[i]:
+            j = int(j)
+            sim = float(s[i, j])
+            if sim < min_sim:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            if (a, b) in seen:
+                continue
+            seen.add((a, b))
+            edges.append({"source": present[a], "target": present[b], "similarity": round(sim, 3)})
+    return edges
+
+
 @mcp.custom_route("/api/network", methods=["GET"])
 async def api_network(request):
-    """Get embedding similarity network for visualization."""
+    """Get embedding similarity network for visualization.
+    ?min_sim=0.85&k=6:最低相似度与每桶最多邻居数(见 _network_edges)。"""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
     try:
+        min_sim = float(request.query_params.get("min_sim", 0.85))
+        k = int(request.query_params.get("k", 6))
+    except ValueError:
+        min_sim, k = 0.85, 6
+    min_sim = max(0.0, min(1.0, min_sim))
+    k = max(1, min(50, k))
+    try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         nodes = []
-        edges = []
-        embeddings = {}
-
         for b in all_buckets:
             meta = b.get("metadata", {})
             bid = b["id"]
@@ -1971,19 +2049,7 @@ async def api_network(request):
                 "pinned": meta.get("pinned", False),
                 "digested": meta.get("digested", False),
             })
-            if embedding_engine and embedding_engine.enabled:
-                emb = await embedding_engine.get_embedding(bid)
-                if emb is not None:
-                    embeddings[bid] = emb
-
-        # Build edges from embeddings (similarity > 0.5)
-        ids = list(embeddings.keys())
-        for i, id_a in enumerate(ids):
-            for id_b in ids[i+1:]:
-                sim = embedding_engine._cosine_similarity(embeddings[id_a], embeddings[id_b])
-                if sim > 0.5:
-                    edges.append({"source": id_a, "target": id_b, "similarity": round(sim, 3)})
-
+        edges = _network_edges([n["id"] for n in nodes], min_sim, k)
         return JSONResponse({"nodes": nodes, "edges": edges})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

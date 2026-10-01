@@ -217,6 +217,9 @@ class BucketManager:
         # --- 登记 archive 目录供模块级定点刷新判归属(单例部署,重复实例化以最后一个为准) ---
         global _ARCHIVE_DIR
         _ARCHIVE_DIR = os.path.normpath(self.archive_dir)
+        # 新实例从空索引开始:索引缓存是模块级的,换一个 buckets_dir 再实例化(测试里
+        # 每个用例一个临时库)会把上一个库的条目带过来。生产只实例化一次,此处无副作用。
+        _invalidate_index()
 
     # ---------------------------------------------------------
     # Create a new bucket

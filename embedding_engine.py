@@ -133,20 +133,55 @@ class EmbeddingEngine:
         return list(embedding)
 
     def _load_vec_cache(self) -> None:
-        """首次使用时把全表向量反序列化进内存;之后 store/delete 同步维护。"""
+        """首次使用时把全表向量反序列化进内存;之后 store/delete 同步维护。
+
+        逐行从游标读,读一行立刻转 float32、丢掉 JSON 文本——不要 fetchall。
+        2026-10-02 实测(1755 行 × 3072 维):每行 JSON 约 60~67KB,fetchall 把
+        ~116MB 文本一次攥在手里,再加逐行 json.loads 的中间 list,进程常驻多出
+        约 200MB;而最终要的 float32 缓存只有 21MB。库从 8 月的 400 行长到
+        1700+ 行后,这一下在 2GB 单节点上足以把节点推进 MemoryPressure
+        (9-29 凌晨被 kubelet 驱逐、断线 8 分钟的大头)。
+        """
         if self._vec_cache is not None:
             return
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
-        conn.close()
         cache = {}
-        for bucket_id, emb_json in rows:
-            try:
-                cache[bucket_id] = self._as_cache_vec(json.loads(emb_json))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
+        conn = sqlite3.connect(self.db_path)
+        try:
+            for bucket_id, emb_json in conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings"
+            ):
+                try:
+                    cache[bucket_id] = self._as_cache_vec(json.loads(emb_json))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+        finally:
+            conn.close()
         self._vec_cache = cache
         self._matrix_dirty = True
+
+    def similarity_matrix(self, ids: list) -> tuple:
+        """
+        给一组 bucket_id 算两两余弦:返回 (有向量的 id 列表, 同序的 n×n float32 矩阵)。
+        走归一化矩阵的一次点积,供 /api/network 与 dream 的提示用——它们原本对
+        每个桶 get_embedding().tolist() 再纯 Python 两两算余弦,1500+ 桶时要多占
+        ~150MB 并把事件循环卡住好几分钟。
+        没有 numpy、向量缓存为空或一个 id 都没命中时返回 ([], None),调用方自行退化。
+        """
+        if not self.enabled or _np is None:
+            return [], None
+        self._load_vec_cache()
+        if not self._vec_cache:
+            return [], None
+        dim = len(next(iter(self._vec_cache.values())))
+        self._ensure_matrix(dim)
+        if self._matrix is None:
+            return [], None
+        pos = {b: i for i, b in enumerate(self._matrix_ids)}
+        present = [b for b in ids if b in pos]
+        if not present:
+            return [], None
+        sub = self._matrix[[pos[b] for b in present]]
+        return present, sub @ sub.T
 
     def _ensure_matrix(self, dim: int) -> None:
         """
@@ -171,7 +206,8 @@ class EmbeddingEngine:
         m = _np.vstack(rows).astype(_np.float32, copy=False)
         norms = _np.linalg.norm(m, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        self._matrix = m / norms
+        m /= norms  # 就地归一化:vstack 出来的已是新数组,不必再复制一份(省 21MB/1755 行)
+        self._matrix = m
         self._matrix_ids = ids
         self._matrix_dirty = False
 
