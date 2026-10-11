@@ -26,6 +26,7 @@
 # ============================================================
 
 import os
+import re
 import math
 import logging
 import shutil
@@ -239,6 +240,8 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        kind: str = None,
+        until: str = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -281,6 +284,12 @@ class BucketManager:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+        # --- 2026-10-11: memory kind + end date, both optional (old buckets simply lack them) ---
+        # --- 记忆类型 + 结束日期，都是可选字段（旧桶没有也没关系）---
+        if kind in ("event", "fact", "todo"):
+            metadata["kind"] = kind
+        if until and re.match(r"^\d{4}-\d{2}-\d{2}", str(until)):
+            metadata["until"] = str(until)[:10]
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -422,6 +431,24 @@ class BucketManager:
             post["name"] = sanitize_name(kwargs["name"])
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
+            # resolved_at：结案时间戳，衰减引擎据此给「沉底但可搜」留宽限再归档
+            if kwargs["resolved"]:
+                if not post.get("resolved_at"):
+                    post["resolved_at"] = now_iso()
+            else:
+                post.metadata.pop("resolved_at", None)
+        if "kind" in kwargs:
+            _k = str(kwargs["kind"] or "").strip().lower()
+            if _k in ("event", "fact", "todo"):
+                post["kind"] = _k
+            elif _k in ("", "-", "none", "null"):
+                post.metadata.pop("kind", None)
+        if "until" in kwargs:
+            _u = str(kwargs["until"] or "").strip()
+            if _u in ("", "-", "none", "null"):
+                post.metadata.pop("until", None)
+            elif re.match(r"^\d{4}-\d{2}-\d{2}$", _u[:10]):
+                post["until"] = _u[:10]
         if "pinned" in kwargs:
             post["pinned"] = bool(kwargs["pinned"])
             if kwargs["pinned"]:
@@ -432,7 +459,10 @@ class BucketManager:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
-        post["last_active"] = now_iso()
+        # _no_touch=True：引擎自己盖章（自动结案 / 补 resolved_at）时不刷新 last_active，
+        # 否则「沉底」这个动作本身会把桶重新变新鲜。
+        if not kwargs.get("_no_touch"):
+            post["last_active"] = now_iso()
 
         try:
             _atomic_write(file_path, frontmatter.dumps(post))

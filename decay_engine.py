@@ -25,7 +25,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from utils import now_diff_days
+from utils import now_diff_days, now_iso
 
 logger = logging.getLogger("ombre_brain.decay")
 
@@ -40,6 +40,33 @@ logger = logging.getLogger("ombre_brain.decay")
 ARCHIVE_UNRESOLVED = os.environ.get(
     "OMBRE_DECAY_ARCHIVE_UNRESOLVED", ""
 ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# ── 2026-10-11 沉底 / 归档规则参数（全部可用环境变量调）───────────────────
+# 背景：importance 写入后永不自动降低，而旧的自动结案只认 importance≤4，全库 1476 个
+# 动态桶只有 36 个够得着；5 分以上的桶没有任何自动沉底的路。现在：
+#   ① 低重要度闲置：importance ≤ AUTO_RESOLVE_MAX_IMPORTANCE 且闲置 > AUTO_RESOLVE_IDLE_DAYS 天
+#   ② 事件过期：kind=event 且 until 已过 EVENT_UNTIL_GRACE_DAYS 天
+#   ③ 待办过期：kind=todo 且 until 已过 TODO_UNTIL_GRACE_DAYS 天、且这期间没人碰
+#   ④ 没写 until 的旧事件：kind=event、创建满 EVENT_NO_UNTIL_AGE_DAYS 天且闲置 ≥ EVENT_NO_UNTIL_IDLE_DAYS 天
+# 结案只是沉底（不浮现、检索降权），不是消失：
+#   ⑤ 归档宽限：结案后至少 RESOLVED_ARCHIVE_GRACE_DAYS 天内仍可被关键词搜到，之后分数低于阈值才归档
+#   ⑥ 里程碑：importance ≥ ARCHIVE_NEVER_MIN_IMPORTANCE 的桶结案后只沉底，永不被引擎归档
+AUTO_RESOLVE_MAX_IMPORTANCE = _env_int("OMBRE_AUTO_RESOLVE_MAX_IMPORTANCE", 5)
+AUTO_RESOLVE_IDLE_DAYS = _env_int("OMBRE_AUTO_RESOLVE_IDLE_DAYS", 30)
+EVENT_UNTIL_GRACE_DAYS = _env_int("OMBRE_EVENT_GRACE_DAYS", 14)
+TODO_UNTIL_GRACE_DAYS = _env_int("OMBRE_TODO_GRACE_DAYS", 45)
+EVENT_NO_UNTIL_AGE_DAYS = _env_int("OMBRE_EVENT_AGE_DAYS", 60)
+EVENT_NO_UNTIL_IDLE_DAYS = _env_int("OMBRE_EVENT_IDLE_DAYS", 30)
+RESOLVED_ARCHIVE_GRACE_DAYS = _env_int("OMBRE_RESOLVED_GRACE_DAYS", 30)
+ARCHIVE_NEVER_MIN_IMPORTANCE = _env_int("OMBRE_ARCHIVE_NEVER_IMPORTANCE", 9)
 
 
 class DecayEngine:
@@ -193,6 +220,38 @@ class DecayEngine:
     # Scan all dynamic buckets → score → archive those below threshold
     # 扫描所有动态桶 → 算分 → 低于阈值的归档
     # ---------------------------------------------------------
+    def auto_resolve_reason(self, meta: dict):
+        """
+        Should this (unresolved, dynamic) bucket be auto-resolved? Return the reason, or None.
+        这个（未解决的动态）桶该不该自动结案？返回原因字符串，不该返回 None。
+        规则见文件头 ①~④；调用方负责只传未解决、非钉选、非 feel 的桶。
+        """
+        try:
+            imp = int(meta.get("importance", 5) or 5)
+        except (TypeError, ValueError):
+            imp = 5
+        idle = now_diff_days(meta.get("last_active", meta.get("created", "")))
+        idle = 999.0 if idle is None else max(0.0, idle)
+        kind = str(meta.get("kind") or "").strip().lower()
+        until = str(meta.get("until") or "").strip()[:10]
+        until_past = now_diff_days(until) if until else None     # until 已过去几天（负数=还没到）
+
+        # ① 低重要度闲置
+        if imp <= AUTO_RESOLVE_MAX_IMPORTANCE and idle > AUTO_RESOLVE_IDLE_DAYS:
+            return f"低重要度闲置 imp={imp} idle={idle:.0f}d"
+        # ② 事件过期 / ③ 待办过期（待办还要求这期间没人碰）
+        if kind in ("event", "todo") and until_past is not None:
+            grace = EVENT_UNTIL_GRACE_DAYS if kind == "event" else TODO_UNTIL_GRACE_DAYS
+            if until_past > grace and (kind == "event" or idle > grace):
+                return f"{kind} 已过期 until={until} +{until_past:.0f}d"
+        # ④ 没写 until 的旧事件：创建够久 + 闲置够久
+        if kind == "event" and not until:
+            age = now_diff_days(meta.get("created", ""))
+            age = 0.0 if age is None else age
+            if age >= EVENT_NO_UNTIL_AGE_DAYS and idle >= EVENT_NO_UNTIL_IDLE_DAYS:
+                return f"旧事件闲置 age={age:.0f}d idle={idle:.0f}d"
+        return None
+
     async def run_decay_cycle(self) -> dict:
         """
         Execute one decay cycle: iterate dynamic buckets, archive those
@@ -211,6 +270,8 @@ class DecayEngine:
         archived = 0
         auto_resolved = 0
         skipped_unresolved = 0   # 低于阈值但因安全阀保住的未解决桶
+        kept_grace = 0           # 已结案但还在归档宽限期内
+        kept_milestone = 0       # 已结案但重要度够高、永不归档
         lowest_score = float("inf")
 
         for bucket in buckets:
@@ -223,24 +284,20 @@ class DecayEngine:
 
             checked += 1
 
-            # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
-            # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
+            # --- Auto-resolve (rules ①~④, see auto_resolve_reason) ---
+            # --- 自动结案（规则 ①~④，见 auto_resolve_reason）---
+            # _no_touch：结案这个动作本身不能刷新 last_active，否则桶又变新鲜了
             if not meta.get("resolved", False):
-                imp = int(meta.get("importance", 5))
-                # 同上：解析失败才当作很久以前；不能让 aware/naive 相减异常把
-                # 所有 imp≤4 的新桶都判成「超过30天」直接沉底
-                days_since = now_diff_days(meta.get("last_active", meta.get("created", "")))
-                if days_since is None:
-                    days_since = 999
-                if imp <= 4 and days_since > 30:
+                reason = self.auto_resolve_reason(meta)
+                if reason:
                     try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
+                        await self.bucket_mgr.update(bucket["id"], resolved=True, _no_touch=True)
                         meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
+                        meta.setdefault("resolved_at", now_iso())
                         auto_resolved += 1
                         logger.info(
                             f"Auto-resolved / 自动结案: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(imp={imp}, days={days_since:.0f})"
+                            f"{meta.get('name', bucket['id'])} ({reason})"
                         )
                     except Exception as e:
                         logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
@@ -259,8 +316,30 @@ class DecayEngine:
             # --- Below threshold → archive (simulate forgetting) ---
             # --- 低于阈值 → 归档（模拟遗忘）---
             if score < self.threshold:
-                # 安全阀：未解决的桶默认不因时间衰减被归档（见文件头说明）
-                if not (meta.get("resolved", False) or ARCHIVE_UNRESOLVED):
+                if meta.get("resolved", False):
+                    # ⑥ 里程碑：重要度够高的结案桶只沉底，永不归档
+                    try:
+                        _imp = int(meta.get("importance", 5) or 5)
+                    except (TypeError, ValueError):
+                        _imp = 5
+                    if _imp >= ARCHIVE_NEVER_MIN_IMPORTANCE:
+                        kept_milestone += 1
+                        continue
+                    # ⑤ 归档宽限：结案后至少保留可搜 N 天。老桶没有 resolved_at 就先盖一个（从今天起算）
+                    _r_at = meta.get("resolved_at")
+                    if not _r_at:
+                        try:
+                            await self.bucket_mgr.update(bucket["id"], resolved=True, _no_touch=True)
+                        except Exception as ex:
+                            logger.warning(f"resolved_at stamp failed / 补结案时间戳失败: {ex}")
+                        kept_grace += 1
+                        continue
+                    _r_days = now_diff_days(_r_at)
+                    if _r_days is None or _r_days < RESOLVED_ARCHIVE_GRACE_DAYS:
+                        kept_grace += 1
+                        continue
+                elif not ARCHIVE_UNRESOLVED:
+                    # 安全阀：未解决的桶默认不因时间衰减被归档（见文件头说明）
                     skipped_unresolved += 1
                     continue
                 try:
@@ -283,6 +362,8 @@ class DecayEngine:
             "archived": archived,
             "auto_resolved": auto_resolved,
             "protected_unresolved": skipped_unresolved,
+            "kept_grace": kept_grace,
+            "kept_milestone": kept_milestone,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")

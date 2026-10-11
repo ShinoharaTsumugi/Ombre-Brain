@@ -17,6 +17,14 @@
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
 | `OMBRE_API_TOKEN` | 否 | — | `/mcp` 与 REST `/api/*` 的鉴权 token（`mcp_auth.py` 用）；客户端用 `Authorization: Bearer <token>` |
 | `MCP_PUBLIC_PATH_SECRET` | 否 | — | 公开秘密路径：设后可用 `https://<域名>/<secret>/mcp` 免鉴权连 `/mcp`（给官方 Claude Chat 连接器，免 OAuth）。留空则关闭。详见 `mcp_auth.py` 顶部注释 |
+| `OMBRE_AUTO_RESOLVE_MAX_IMPORTANCE` | 否 | `5` | 低重要度闲置自动结案：importance ≤ 此值（原来写死 4） |
+| `OMBRE_AUTO_RESOLVE_IDLE_DAYS` | 否 | `30` | …且距上次激活超过这么多天 |
+| `OMBRE_EVENT_GRACE_DAYS` | 否 | `14` | `kind=event` 的桶 `until` 过了这么多天自动结案 |
+| `OMBRE_TODO_GRACE_DAYS` | 否 | `45` | `kind=todo` 的桶 `until` 过了这么多天、且这期间没人碰 → 自动结案 |
+| `OMBRE_EVENT_AGE_DAYS` / `OMBRE_EVENT_IDLE_DAYS` | 否 | `60` / `30` | 没写 `until` 的 event：创建满 AGE 天且闲置满 IDLE 天 → 自动结案 |
+| `OMBRE_RESOLVED_GRACE_DAYS` | 否 | `30` | 结案后至少保留这么多天可被关键词搜到，之后分数低于阈值才归档 |
+| `OMBRE_ARCHIVE_NEVER_IMPORTANCE` | 否 | `9` | importance ≥ 此值的桶结案后只沉底、永不被衰减引擎归档 |
+| `OMBRE_DECAY_ARCHIVE_UNRESOLVED` | 否 | `false` | 设为 true 才允许**未结案**的桶仅因时间衰减被归档（安全阀，默认关） |
 
 ## 说明
 

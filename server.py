@@ -601,6 +601,16 @@ def _grow_seen_record(content: str) -> None:
 # Shared by hold and grow to avoid duplicate logic
 # hold 和 grow 共用，避免重复逻辑
 # =============================================================
+def _kind_until_updates(meta: dict, kind, until) -> dict:
+    """合并进旧桶时 kind/until 的取法：旧桶没有 kind 才补；until 取更晚的那个（事件被延长）。"""
+    out = {}
+    if kind and not meta.get("kind"):
+        out["kind"] = kind
+    if until and str(until) > str(meta.get("until") or ""):
+        out["until"] = until
+    return out
+
+
 async def _merge_or_create(
     content: str,
     tags: list,
@@ -609,6 +619,8 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    kind: str = None,
+    until: str = None,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -653,6 +665,7 @@ async def _merge_or_create(
                     domain=list(set(bucket["metadata"].get("domain", []) + domain)),
                     valence=merged_valence,
                     arousal=merged_arousal,
+                    **_kind_until_updates(bucket["metadata"], kind, until),
                 )
                 # --- Update embedding after merge ---
                 try:
@@ -671,6 +684,8 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        kind=kind,
+        until=until,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -698,8 +713,9 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
+    touch: bool = True,
 ) -> str:
-    """breath - 检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。传单个完整bucket_id(12位十六进制)=返回该桶未压缩的原文(改content前先这样读原文,别拿摘要覆盖)。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """breath - 检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。传单个完整bucket_id(12位十六进制)=返回该桶未压缩的原文(改content前先这样读原文,别拿摘要覆盖)。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。touch=False只读不留痕(不刷新last_active/激活次数;聊天app每轮自动检索用),你主动翻记忆保持默认True。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -1005,7 +1021,10 @@ async def breath(
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
     _t_drift = time.monotonic() - _bt2
-    if _touch_ids:
+    # touch=False：自动检索（聊天 app 每轮 / 写信 / 闹钟等）只读不留痕——否则每轮都把命中的桶
+    # 和它们 ±48h 的邻桶重新变「新鲜」，衰减引擎永远分不清旧事和新事（2026-10-11 实测：
+    # 60 天以上的旧桶 last_active 中位数只有 3 天、激活次数中位 135）。
+    if _touch_ids and touch:
         _spawn_bg(_touch_batch(_touch_ids))
     _timing = (f"breath timing ms: total={int((time.monotonic()-_bt0)*1000)} "
                f"search={int(_t_search*1000)} vector={int(_t_vector*1000)} "
@@ -1030,20 +1049,21 @@ async def breath(
 async def hold(
     content: str,
     tags: str = "",
-    importance: int = 5,
+    importance: int = -1,
     pinned: bool = False,
     feel: bool = False,
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
 ) -> str:
-    """hold - 存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """hold - 存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-9(不传=按刻度自动判;钉选固定10)。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
 
-    importance = max(1, min(10, importance))
+    auto_importance = importance < 1          # 没传（-1）→ 让打标器按刻度给
+    importance = max(1, min(10, importance)) if importance >= 1 else 5
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
 
     # --- Feel mode: store as feel type, minimal metadata ---
@@ -1093,6 +1113,11 @@ async def hold(
     auto_arousal = analysis["arousal"]
     auto_tags = analysis["tags"]
     suggested_name = analysis.get("suggested_name", "")
+    # --- importance：显式传了就尊重；没传用打标器按刻度给（1~9）。kind/until 一律来自打标器 ---
+    if auto_importance and isinstance(analysis.get("importance"), int):
+        importance = max(1, min(9, analysis["importance"]))
+    kind = analysis.get("kind")
+    until = analysis.get("until")
 
     # --- User-supplied valence/arousal takes priority over analyze() result ---
     # --- 用户显式传入的 valence/arousal 优先，analyze() 结果作为 fallback ---
@@ -1114,6 +1139,8 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            kind=kind,
+            until=until,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -1130,6 +1157,8 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        kind=kind,
+        until=until,
     )
 
     action = "合并→" if is_merged else "新建→"
@@ -1172,11 +1201,13 @@ async def grow(content: str) -> str:
         result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
-            importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
+            importance=max(1, min(9, analysis["importance"])) if isinstance(analysis.get("importance"), int) else 5,
             domain=analysis.get("domain", ["未分类"]),
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            kind=analysis.get("kind"),
+            until=analysis.get("until"),
         )
         action = "合并" if is_merged else "新建"
         _grow_seen_record(content)
@@ -1208,6 +1239,8 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
+                kind=item.get("kind"),
+                until=item.get("until"),
             )
 
             if is_merged:
@@ -1254,8 +1287,10 @@ async def trace(
     delete: bool = False,
     restore: bool = False,
     force: bool = False,
+    kind: str = "",
+    until: str = "",
 ) -> str:
-    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文(会整体替换,改前先用breath(bucket_id)读原文,别拿摘要覆盖),delete=True遗忘(可恢复),restore=True把遗忘/归档的桶取回,force=True确认要用明显更短的内容覆盖原文。只传需改的,-1或空=不改。"""
+    """trace - 修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1标记已写过feel(只加速褪色,不挡浮现),kind=event/fact/todo(传"-"清除),until=YYYY-MM-DD事件结束日(传"-"清除;event过期14天/todo过期45天自动沉底),content=替换桶正文(会整体替换,改前先用breath(bucket_id)读原文,别拿摘要覆盖),delete=True遗忘(可恢复),restore=True把遗忘/归档的桶取回,force=True确认要用明显更短的内容覆盖原文。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1323,6 +1358,10 @@ async def trace(
             updates["importance"] = 10  # pinned → lock importance
     if digested in (0, 1):
         updates["digested"] = bool(digested)
+    if kind:
+        updates["kind"] = kind       # event/fact/todo；"-" 清除（bucket_manager.update 校验）
+    if until:
+        updates["until"] = until     # YYYY-MM-DD；"-" 清除
     if content:
         # --- Shrink guard: refuse to overwrite a bucket with a much shorter body ---
         # --- 缩水守卫：拒绝用明显更短的正文覆盖原文 ---
@@ -1703,6 +1742,7 @@ async def api_breath(request):
             arousal=body.get("arousal", -1),
             max_results=body.get("max_results", 20),
             importance_min=body.get("importance_min", -1),
+            touch=bool(body.get("touch", True)),
         )
         return JSONResponse({"ok": True, "result": result})
     except Exception as e:
@@ -1733,7 +1773,7 @@ async def api_hold(request):
         result = await hold(
             content=content,
             tags=body.get("tags", ""),
-            importance=body.get("importance", 5),
+            importance=body.get("importance", -1),
             pinned=body.get("pinned", False),
             feel=body.get("feel", False),
             source_bucket=body.get("source_bucket", ""),
@@ -1807,6 +1847,8 @@ async def api_trace(request):
             content=body.get("content", ""),
             delete=body.get("delete", False),
             restore=body.get("restore", False),
+            kind=body.get("kind", ""),
+            until=body.get("until", ""),
             force=body.get("force", False),
         )
         return JSONResponse({"ok": True, "result": result})
@@ -1906,6 +1948,9 @@ async def api_buckets(request):
                 "resolved": meta.get("resolved", False),
                 "pinned": meta.get("pinned", False),
                 "digested": meta.get("digested", False),
+                "kind": meta.get("kind"),
+                "until": meta.get("until"),
+                "resolved_at": meta.get("resolved_at"),
                 "created": meta.get("created", ""),
                 "last_active": meta.get("last_active", ""),
                 "activation_count": meta.get("activation_count", 1),

@@ -86,6 +86,63 @@ def _perspective_rule(human: str) -> str:
 
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
 # --- 脱水提示词：指导廉价 LLM 压缩信息 ---
+# ---------------------------------------------------------
+# Importance rubric + memory kind (shared by DIGEST / ANALYZE prompts)
+# 重要度刻度 + 记忆类型（DIGEST / ANALYZE 两个提示词共用）
+# 2026-10-11：此前只有一句「1-10 按重要程度判断」，模型普遍给 7~9，重要度失去区分度；
+# 而重要度写入后永不自动降低，旧事件一直顶着高分。刻度让分数有意义，kind/until 让
+# 「这件事已经过去了」可以被 decay_engine 识别并自动结案。
+# ---------------------------------------------------------
+IMPORTANCE_RUBRIC = """
+importance 刻度（严格按此打分，只能填 1~9；10 保留给手动钉选，不要给）：
+  1~2 流水：打招呼、临时提问、当天就过去的小动作
+  3~4 日常：吃了什么、作息、普通闲聊、例行提醒（服药/早安类），没有后续
+  5~6 有后续的事：计划、待办、近期安排、一次性的具体事件（出行、考试、购物、一次争执）
+  7~8 会长期影响相处的：她的偏好与习惯、关系里的约定与承诺、健康与用药方案的变化、重要的人与关系
+  9   身份级：她是谁（性取向、家庭、疾病史、核心价值观）、两人关系的基石事件
+  判断只看一条：「一年后还需要记得它吗」——需要→7 以上；一个月后就无所谓→4 以下
+kind（记忆类型，三选一）：
+  event = 有起止的事件、一次性的经历（考试、出行、一次对话、一次争执），过了就是过去
+  fact  = 关于她/我/关系的持久事实、偏好、习惯、规则，不随时间失效
+  todo  = 待办、计划、承诺，做完才算结束
+until：event/todo 若能从内容判断出结束日期或发生日期，填 "YYYY-MM-DD"（相对日期按「今天」推算）；判断不出填 null；fact 固定 null"""
+
+_VALID_KINDS = ("event", "fact", "todo")
+_UNTIL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _clean_kind(value):
+    """模型给的 kind → 合法值或 None。"""
+    v = str(value or "").strip().lower()
+    return v if v in _VALID_KINDS else None
+
+
+def _clean_until(value):
+    """模型给的 until → 'YYYY-MM-DD' 或 None（null/空/格式不对都当没有）。"""
+    s = str(value or "").strip()
+    if not s or s.lower() in ("null", "none", "无"):
+        return None
+    s = s[:10]
+    return s if _UNTIL_RE.match(s) else None
+
+
+def _clean_importance(value, default=None):
+    """模型给的 importance → 1~9 的整数；给不出就 default。10 只能来自钉选。"""
+    try:
+        return max(1, min(9, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _today_line() -> str:
+    """让模型知道今天几号，才能把「这周五」「6 月 20 日」换算成 until。"""
+    try:
+        from utils import now_local_str
+        return f"\n今天是 {now_local_str('%Y-%m-%d')}（用于推算 until 里的相对日期）。"
+    except Exception:
+        return ""
+
+
 DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水为紧凑摘要。
 
 压缩规则：
@@ -133,7 +190,9 @@ DIGEST_PROMPT = """你是一个记忆整理专家，正在为「我」——一�
     "valence": 0.7,
     "arousal": 0.4,
     "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2"],
-    "importance": 5
+    "importance": 5,
+    "kind": "event",
+    "until": null
   }
 ]
 
@@ -148,9 +207,9 @@ tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 
   数字: ["编程", "AI", "硬件", "网络"]
   事务: ["财务", "计划", "待办"]
   内心: ["情绪", "回忆", "梦境", "自省"]
-importance: 1-10，根据内容重要程度判断
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
-arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
+arousal: 0~1（0=平静, 0.5=普通, 1=激动）
+""" + IMPORTANCE_RUBRIC
 
 
 # --- Merge prompt: instruct LLM to blend old and new memories ---
@@ -189,6 +248,7 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    两步合并为一个 tags 数组，总计 10~15 个
 5. suggested_name（建议桶名）：10字以内的简短标题
 6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+7. importance / kind / until：按文末的刻度给
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -196,8 +256,12 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "valence": 0.7,
   "arousal": 0.4,
   "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
-  "suggested_name": "简短标题"
-}"""
+  "suggested_name": "简短标题",
+  "importance": 5,
+  "kind": "fact",
+  "until": null
+}
+""" + IMPORTANCE_RUBRIC
 
 
 class Dehydrator:
@@ -609,7 +673,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": ANALYZE_PROMPT},
+                {"role": "system", "content": ANALYZE_PROMPT + _today_line()},
                 {"role": "user", "content": content[:2000]},
             ],
             max_tokens=512,
@@ -660,6 +724,9 @@ class Dehydrator:
             "arousal": arousal,
             "tags": result.get("tags", [])[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
+            "importance": _clean_importance(result.get("importance")),   # None=模型没给
+            "kind": _clean_kind(result.get("kind")),
+            "until": _clean_until(result.get("until")),
         }
 
     # ---------------------------------------------------------
@@ -677,6 +744,9 @@ class Dehydrator:
             "arousal": 0.3,
             "tags": [],
             "suggested_name": "",
+            "importance": None,
+            "kind": None,
+            "until": None,
         }
 
     # ---------------------------------------------------------
@@ -690,7 +760,7 @@ class Dehydrator:
         Split a large chunk of daily content into independent memory entries.
         将一大段日常内容拆分成多个独立记忆条目。
 
-        Returns: [{"name", "content", "domain", "valence", "arousal", "tags", "importance"}, ...]
+        Returns: [{"name", "content", "domain", "valence", "arousal", "tags", "importance", "kind", "until"}, ...]
         """
         if not content or not content.strip():
             return []
@@ -720,7 +790,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": DIGEST_PROMPT + _perspective_rule(self.human)},
+                {"role": "system", "content": DIGEST_PROMPT + _perspective_rule(self.human) + _today_line()},
                 {"role": "user", "content": content[:5000]},
             ],
             max_tokens=2048,
@@ -760,7 +830,7 @@ class Dehydrator:
             if not isinstance(item, dict) or not item.get("content"):
                 continue
             try:
-                importance = max(1, min(10, int(item.get("importance", 5))))
+                importance = max(1, min(9, int(item.get("importance", 5))))   # 10 只给钉选
             except (ValueError, TypeError):
                 importance = 5
             try:
@@ -777,5 +847,7 @@ class Dehydrator:
                 "arousal": arousal,
                 "tags": item.get("tags", [])[:15],
                 "importance": importance,
+                "kind": _clean_kind(item.get("kind")),
+                "until": _clean_until(item.get("until")),
             })
         return validated
